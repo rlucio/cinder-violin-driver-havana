@@ -22,13 +22,21 @@ Setup
 
     Examples:
 
-    For devstack: cp -r cinder /opt/stack/cinder
+    For devstack: 'cp -r cinder /opt/stack/cinder'
 
-    For ubuntu: cp -r cinder /usr/local/lib/python2.7/dist-packages/cinder
+    For ubuntu: 'cp -r cinder /usr/local/lib/python2.7/dist-packages/cinder'
 
-3. Configure cinder to use the violin driver (see below).
+3. Create an openstack igroup on the Violin v6xxx array.
 
-4. Restart cinder-volume.
+    'igroup create name openstack'
+
+4. If you haven't setup iSCSI on your array, follow your system
+   documentation to enable iSCSI and configure your HBAs with
+   appropriate IP addresses.
+
+5. Configure cinder to use the violin driver (see below).
+
+6. Restart cinder-volume.
 
 Configuration
 -------------
@@ -73,6 +81,10 @@ look like this:
     gateway_vip=1.2.3.4
     gateway_mga=1.2.3.5
     gateway_mgb=1.2.3.6
+
+Note: if you add the configuration option 'verbose=True' and/or
+'debug=True' to cinder.conf, you will receive helpful logging from the
+Violin driver in /var/log/cinder/cinder-volume.log.
 
 Questions?
 ----------
