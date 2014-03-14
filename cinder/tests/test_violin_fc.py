@@ -35,8 +35,8 @@ import time
 import unittest
 
 # TODO(rdl): import and use test utils (cinder.tests.utils)
-from cinder import exception
 from cinder.db.sqlalchemy import models
+from cinder import exception
 from cinder.volume.drivers.violin import vxg
 from cinder.volume.drivers.violin.vxg.core.node import XGNode
 from cinder.volume.drivers.violin.vxg.core.session import XGSession
@@ -74,6 +74,8 @@ class testViolinFC(unittest.TestCase):
         self.driver.vmem_vip = self.m_conn
         self.driver.vmem_mga = self.m_conn
         self.driver.vmem_mgb = self.m_conn
+        self.driver.gateway_ids = {'/vshare/state/global/1': 1,
+                                   '/vshare/state/global/2': 2}
         self.driver.container = 'myContainer'
         self.driver.device_id = 'ata-VIOLIN_MEMORY_ARRAY_23109R00000022'
         self.stats = {}
@@ -112,7 +114,6 @@ class testViolinFC(unittest.TestCase):
         self.driver.vmem_mgb = None
         self.driver.container = ""
         self.driver.device_id = ""
-        self.driver.array_info = []
         self.m.StubOutWithMock(vxg, 'open')
         self.m.StubOutWithMock(self.driver, '_get_active_fc_targets')
         vxg.open(mox.IsA(str), mox.IsA(str),
@@ -121,6 +122,7 @@ class testViolinFC(unittest.TestCase):
                  mox.IsA(str)).AndReturn(self.m_conn)
         vxg.open(mox.IsA(str), mox.IsA(str),
                  mox.IsA(str)).AndReturn(self.m_conn)
+        self.m_conn.basic.get_node_values(mox.IsA(str))
         self.m_conn.basic.get_node_values(mox.IsA(str))
         self.m_conn.basic.get_node_values(mox.IsA(str))
         self.m_conn.basic.get_node_values(mox.IsA(str))
@@ -332,7 +334,6 @@ class testViolinFC(unittest.TestCase):
         self.m.StubOutWithMock(self.driver, '_send_cmd')
         self.driver._send_cmd(self.m_conn.lun.create_lun,
                               mox.IsA(str),
-                              mox.IsA(str),
                               self.driver.container, volume['name'],
                               volume['size'], 1, "0", "0", "w", 1,
                               512).AndReturn(response)
@@ -345,7 +346,6 @@ class testViolinFC(unittest.TestCase):
         response = {'code': 0, 'message': 'LUN deletion started'}
         self.m.StubOutWithMock(self.driver, '_send_cmd')
         self.driver._send_cmd(self.m_conn.lun.bulk_delete_luns,
-                              mox.IsA(str),
                               mox.IsA(str),
                               self.driver.container,
                               volume['name']).AndReturn(response)
@@ -360,7 +360,6 @@ class testViolinFC(unittest.TestCase):
         self.m.StubOutWithMock(self.driver, '_send_cmd')
         self.driver._send_cmd(self.m_conn.snapshot.create_lun_snapshot,
                               mox.IsA(str),
-                              mox.IsA(str),
                               self.driver.container,
                               snapshot['volume_name'],
                               snapshot['name']).AndReturn(response)
@@ -374,7 +373,6 @@ class testViolinFC(unittest.TestCase):
         self.m.StubOutWithMock(self.driver, '_send_cmd')
         self.driver._send_cmd(self.m_conn.snapshot.delete_lun_snapshot,
                               mox.IsA(str),
-                              mox.IsA(str),
                               self.driver.container,
                               snapshot['volume_name'],
                               snapshot['name']).AndReturn(response)
@@ -385,12 +383,15 @@ class testViolinFC(unittest.TestCase):
     def testExportLun(self):
         volume = self.volume1
         lun_id = 1
-        response = {'code': 0, 'message': 'success'}
+        response = {'code': 0, 'message': ''}
+        self.m.StubOutWithMock(self.driver, '_send_cmd')
         self.m.StubOutWithMock(self.driver, '_wait_for_exportstate')
         self.m.StubOutWithMock(self.driver, '_get_lun_id')
-        self.m_conn.lun.export_lun(self.driver.container, volume['name'],
-                                   'all', self.config.gateway_fcp_igroup_name,
-                                   'auto').AndReturn(response)
+        self.driver._send_cmd(self.m_conn.lun.export_lun,
+                              mox.IsA(str),
+                              self.driver.container, volume['name'],
+                              'all', self.config.gateway_fcp_igroup_name,
+                              'auto').AndReturn(response)
         self.driver._wait_for_exportstate(volume['name'], True)
         self.driver._get_lun_id(volume['name']).AndReturn(lun_id)
         self.m.ReplayAll()
@@ -400,10 +401,13 @@ class testViolinFC(unittest.TestCase):
     def testUnexportLun(self):
         volume = self.volume1
         lun_id = 1
-        response = {'code': 0, 'message': 'success'}
+        response = {'code': 0, 'message': ''}
+        self.m.StubOutWithMock(self.driver, '_send_cmd')
         self.m.StubOutWithMock(self.driver, '_wait_for_exportstate')
-        self.m_conn.lun.unexport_lun(self.driver.container, volume['name'],
-                                     'all', 'all', 'auto').AndReturn(response)
+        self.driver._send_cmd(self.m_conn.lun.unexport_lun,
+                              mox.IsA(str),
+                              self.driver.container, volume['name'],
+                              'all', 'all', 'auto').AndReturn(response)
         self.driver._wait_for_exportstate(volume['name'], False)
         self.m.ReplayAll()
         self.assertTrue(self.driver._unexport_lun(volume) is None)
@@ -493,13 +497,12 @@ class testViolinFC(unittest.TestCase):
         request_func(request_args).AndReturn(response)
         self.m.ReplayAll()
         self.assertEqual(self.driver._send_cmd
-                         (request_func, success_msg,
-                          exception_msg, request_args),
+                         (request_func, success_msg, request_args),
                          response)
         self.m.VerifyAll()
 
     def testSendCmd_RequestTimedout(self):
-        ''' the retry timeout is hit '''
+        '''the retry timeout is hit '''
         request_func = self.m.CreateMockAnything()
         success_msg = 'success'
         exception_msg = 'failed'
@@ -508,12 +511,11 @@ class testViolinFC(unittest.TestCase):
         self.m.ReplayAll()
         self.assertRaises(violin.RequestRetryTimeout,
                           self.driver._send_cmd,
-                          request_func, success_msg,
-                          exception_msg, request_args)
+                          request_func, success_msg, request_args)
         self.m.VerifyAll()
 
     def testSendCmd_ResponseHasNoMessage(self):
-        ''' the callback response dict has a NULL message field '''
+        '''the callback response dict has a NULL message field '''
         request_func = self.m.CreateMockAnything()
         success_msg = 'success'
         exception_msg = 'failed'
@@ -527,13 +529,12 @@ class testViolinFC(unittest.TestCase):
         request_func(request_args).AndReturn(response2)
         self.m.ReplayAll()
         self.assertEqual(self.driver._send_cmd
-                         (request_func, success_msg,
-                          exception_msg, request_args),
+                         (request_func, success_msg, request_args),
                          response2)
         self.m.VerifyAll()
 
     def testSendCmd_ResponseHasFatalError(self):
-        ''' the callback response dict contains a fatal error code '''
+        '''the callback response dict contains a fatal error code '''
         request_func = self.m.CreateMockAnything()
         success_msg = 'success'
         exception_msg = 'failed'
@@ -543,17 +544,16 @@ class testViolinFC(unittest.TestCase):
         time.sleep(mox.IsA(int))
         request_func(request_args).AndReturn(response)
         self.m.ReplayAll()
-        self.assertRaises(exception.Error,
+        self.assertRaises(violin.ViolinBackendErr,
                           self.driver._send_cmd,
-                          request_func, success_msg,
-                          exception_msg, request_args)
+                          request_func, success_msg, request_args)
         self.m.VerifyAll()
 
     def testGetLunID(self):
         volume = {'name': 'vol-01', 'size': '1'}
         bn = '/vshare/config/export/container/myContainer/lun/vol-01/target/**'
         resp = {'/vshare/config/export/container/myContainer/lun'
-                '/vol-01/target/hba-a1/initiator/openstack/lun_id' : 1}
+                '/vol-01/target/hba-a1/initiator/openstack/lun_id': 1}
         self.m_conn.basic.get_node_values(bn).AndReturn(resp)
         self.m.ReplayAll()
         self.assertEqual(self.driver._get_lun_id(volume['name']), 1)
@@ -561,22 +561,23 @@ class testViolinFC(unittest.TestCase):
 
     def testWaitForExportState(self):
         bn = '/vshare/config/export/container/myContainer/lun/vol-01'
-        resp = {'/vshare/config/export/container/myContainer/lun/vol-01': 'vol-01'}
+        resp = {'/vshare/config/export/container/myContainer/lun/vol-01':
+                'vol-01'}
         self.m_conn.basic.get_node_values(bn).AndReturn(resp)
         self.m.ReplayAll()
-        self.assertEqual(self.driver._wait_for_exportstate('vol-01', True), True)
+        self.assertEqual(self.driver._wait_for_exportstate('vol-01', True),
+                         True)
         self.m.VerifyAll()
 
     def testGetActiveFcTargets(self):
-        bn1 = '/vshare/state/global/*'
-        resp1 = {'/vshare/state/global/1' : 1, '/vshare/state/global/2' : 2}
-        bn2 = '/vshare/state/global/2/target/fc/**'
-        resp2 = {'/vshare/state/global/2/target/fc/hba-a1/wwn' : 'wwn.21:00:00:24:ff:45:fb:22'}
-        bn3 = '/vshare/state/global/1/target/fc/**'
-        resp3 = {'/vshare/state/global/1/target/fc/hba-a1/wwn' : 'wwn.21:00:00:24:ff:45:e2:30'}
+        bn1 = '/vshare/state/global/2/target/fc/**'
+        resp1 = {'/vshare/state/global/2/target/fc/hba-a1/wwn':
+                 'wwn.21:00:00:24:ff:45:fb:22'}
+        bn2 = '/vshare/state/global/1/target/fc/**'
+        resp2 = {'/vshare/state/global/1/target/fc/hba-a1/wwn':
+                 'wwn.21:00:00:24:ff:45:e2:30'}
         self.m_conn.basic.get_node_values(bn1).AndReturn(resp1)
         self.m_conn.basic.get_node_values(bn2).AndReturn(resp2)
-        self.m_conn.basic.get_node_values(bn3).AndReturn(resp3)
         result = ['21000024ff45fb22', '21000024ff45e230']
         self.m.ReplayAll()
         self.assertEqual(self.driver._get_active_fc_targets(), result)

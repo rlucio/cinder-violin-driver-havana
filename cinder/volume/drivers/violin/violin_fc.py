@@ -32,16 +32,13 @@ Volume Create/Delete:           YES
 Export Create/Remove:           YES
 Volume Attach/Detach:           YES
 Snapshot Create/Delete:         YES
-Create Volume from Snapshot:    NO
+Create Volume from Snapshot:    YES
+Clone Volume:                   YES
 Get Volume Stats:               YES
 Copy Image to Volume:           YES*
 Copy Volume to Image:           YES*
-Clone Volume:                   NO
 
-* functionality inherited from built-in driver code (unverified)
-
-To cleanup the volumes table:
-mysql> delete from volumes where display_name="v4";
+* functionality inherited from base class driver
 """
 
 import random
@@ -51,8 +48,8 @@ import time
 
 from oslo.config import cfg
 
-from cinder import exception
 from cinder.db.sqlalchemy import models
+from cinder import exception
 from cinder.openstack.common import log as logging
 from cinder.openstack.common import timeutils
 from cinder.volume.driver import FibreChannelDriver
@@ -103,8 +100,22 @@ CONF.register_opts(violin_opts)
 class InvalidBackendConfig(exception.CinderException):
     message = _("Volume backend config is invalid: %(reason)s")
 
+
 class RequestRetryTimeout(exception.CinderException):
     message = _("Backend service retry timeout hit: %(timeout)s sec")
+
+
+class ViolinBackendErr(exception.CinderException):
+    message = _("Backend reports: %(message)s")
+
+
+class ViolinBackendErrExists(exception.CinderException):
+    message = _("Backend reports: item already exists")
+
+
+class ViolinBackendErrNotFound(exception.CinderException):
+    message = _("Backend reports: item not found")
+
 
 class ViolinFCDriver(FibreChannelDriver):
     """Executes commands relating to Violin Memory Arrays """
@@ -113,8 +124,8 @@ class ViolinFCDriver(FibreChannelDriver):
         super(ViolinFCDriver, self).__init__(*args, **kwargs)
         self.session_start_time = 0
         self.session_timeout = 900
-        self.request_timeout = 60
-        self.array_info = []
+        self.request_timeout = 300
+        self.gateway_ids = {}
         self.vmem_vip = None
         self.vmem_mga = None
         self.vmem_mgb = None
@@ -152,6 +163,9 @@ class ViolinFCDriver(FibreChannelDriver):
 
         vip = self.vmem_vip.basic
 
+        self.gateway_ids = self.vmem_vip.basic.get_node_values(
+            '/vshare/state/global/*')
+
         ret_dict = vip.get_node_values("/vshare/state/local/container/*")
         if ret_dict:
             self.container = ret_dict.items()[0][1]
@@ -163,8 +177,6 @@ class ViolinFCDriver(FibreChannelDriver):
         if ret_dict:
             self.timeout = ret_dict.items()[0][1]
 
-        # With FCP, the WWNs are created when the container is setup.
-        #
         self.gateway_fc_wwns = self._get_active_fc_targets()
 
     def check_for_setup_error(self):
@@ -196,14 +208,14 @@ class ViolinFCDriver(FibreChannelDriver):
         self._delete_lun(volume)
 
     def create_volume_from_snapshot(self, volume, snapshot):
-        """Creates a volume from a snapshot """
+        """Creates a volume from an existing snapshot """
         snapshot['size'] = snapshot['volume']['size']
         self._login()
         self._create_lun(volume)
         self.copy_volume_data(self.context, snapshot, volume)
 
     def create_cloned_volume(self, volume, src_vref):
-        """Creates a clone of the specified volume."""
+        """Creates a full clone of the specified volume."""
         self._login()
         self._create_lun(volume)
         self.copy_volume_data(self.context, src_vref, volume)
@@ -282,17 +294,23 @@ class ViolinFCDriver(FibreChannelDriver):
 
         LOG.info(_("Creating lun %(name)s, %(size)s GB") % volume)
 
-        # using the defaults for other fields: (container, name, size,
-        # quantity, nozero, thin, readonly, startnum, blksize)
+        # using the defaults for other fields: (quantity, nozero, thin,
+        # readonly, startnum, blksize)
         #
 
-        resp = self._send_cmd(v.lun.create_lun,
-                              'LUN create: success!',
-                              'LUN create failed',
-                              self.container, volume['name'],
-                              volume['size'], 1, "0", "0", "w", 1, 512)
+        try:
+            self._send_cmd(v.lun.create_lun,
+                           'LUN create: success!',
+                           self.container, volume['name'],
+                           volume['size'], 1, "0", "0", "w", 1, 512)
 
-        LOG.info(_('Leaving create_lun code:%(code)d, msg:%(message)s') % resp)
+        except ViolinBackendErrExists:
+            LOG.info(_("Lun %s already exists, continuing") %
+                     volume['name'])
+
+        except Exception:
+            LOG.info(_("Lun create failed!"))
+            raise
 
     def _delete_lun(self, volume):
         """
@@ -308,12 +326,23 @@ class ViolinFCDriver(FibreChannelDriver):
 
         LOG.info(_("Deleting lun %s"), volume['name'])
 
-        resp = self._send_cmd(v.lun.bulk_delete_luns,
-                              'LUN deletion started',
-                              'LUN delete failed',
-                              self.container, volume['name'])
+        try:
+            self._send_cmd(v.lun.bulk_delete_luns,
+                           'LUN deletion started',
+                           self.container, volume['name'])
 
-        LOG.info(_('Leaving delete_lun code:%(code)d, msg:%(message)s') % resp)
+        except ViolinBackendErrNotFound:
+            LOG.info(_("Lun %s already deleted, continuing") %
+                     volume['name'])
+
+        except ViolinBackendErrExists:
+            LOG.info(_("Lun %s has dependent snapshots, skipping") %
+                     volume['name'])
+            raise exception.VolumeIsBusy(volume_name=volume['name'])
+
+        except Exception:
+            LOG.exception(_("Lun delete failed!"))
+            raise
 
     def _create_lun_snapshot(self, snapshot):
         """
@@ -329,13 +358,19 @@ class ViolinFCDriver(FibreChannelDriver):
 
         LOG.info(_("Creating snapshot %s"), snapshot['name'])
 
-        resp = self._send_cmd(v.snapshot.create_lun_snapshot,
-                              'Snapshot create: success!',
-                              'LUN snapshot create failed',
-                              self.container, snapshot['volume_name'],
-                              snapshot['name'])
+        try:
+            self._send_cmd(v.snapshot.create_lun_snapshot,
+                           'Snapshot create: success!',
+                           self.container, snapshot['volume_name'],
+                           snapshot['name'])
 
-        LOG.info(_('Leaving create_lun code:%(code)d, msg:%(message)s') % resp)
+        except ViolinBackendErrExists:
+            LOG.info(_("Snapshot %s already exists, continuing") %
+                     snapshot['name'])
+
+        except Exception:
+            LOG.exception(_("LUN snapshot create failed!"))
+            raise
 
     def _delete_lun_snapshot(self, snapshot):
         """
@@ -351,13 +386,19 @@ class ViolinFCDriver(FibreChannelDriver):
 
         LOG.info(_("Deleting snapshot %s"), snapshot['name'])
 
-        resp = self._send_cmd(v.snapshot.delete_lun_snapshot,
-                              'Snapshot delete: success!',
-                              'LUN snapshot delete failed',
-                              self.container, snapshot['volume_name'],
-                              snapshot['name'])
+        try:
+            self._send_cmd(v.snapshot.delete_lun_snapshot,
+                           'Snapshot delete: success!',
+                           self.container, snapshot['volume_name'],
+                           snapshot['name'])
 
-        LOG.info(_('Leaving delete_lun_snapshot code:%(code)d, msg:%(message)s') % resp)
+        except ViolinBackendErrNotFound:
+            LOG.info(_("Snapshot %s already deleted, continuing") %
+                     snapshot['name'])
+
+        except Exception:
+            LOG.exception(_("LUN snapshot delete failed!"))
+            raise
 
     def _export_lun(self, volume):
         """
@@ -372,21 +413,24 @@ class ViolinFCDriver(FibreChannelDriver):
         Returns:
             lun_id -- the LUN ID assigned by the backend
         """
+        lun_id = -1
         v = self.vmem_vip
 
         LOG.info(_("Exporting lun %s"), volume['name'])
 
-        resp = v.lun.export_lun(self.container, volume['name'], 'all',
-                                self.config.gateway_fcp_igroup_name,
-                                'auto')
+        try:
+            self._send_cmd(v.lun.export_lun, '',
+                           self.container, volume['name'], 'all',
+                           self.config.gateway_fcp_igroup_name,
+                           'auto')
 
-        if resp['code'] != 0:
-            raise exception.Error(
-                _('LUN export failed: %(code)d, %(message)s') % resp)
+        except Exception:
+            LOG.exception(_("LUN export failed!"))
+            raise
 
-        self._wait_for_exportstate(volume['name'], True)
-
-        lun_id = self._get_lun_id(volume['name'])
+        else:
+            self._wait_for_exportstate(volume['name'], True)
+            lun_id = self._get_lun_id(volume['name'])
 
         return lun_id
 
@@ -404,14 +448,17 @@ class ViolinFCDriver(FibreChannelDriver):
 
         LOG.info(_("Unexporting lun %s"), volume['name'])
 
-        resp = v.lun.unexport_lun(self.container, volume['name'],
-                                  'all', 'all', 'auto')
+        try:
+            self._send_cmd(v.lun.unexport_lun, '',
+                           self.container, volume['name'],
+                           'all', 'all', 'auto')
 
-        if resp['code'] != 0:
-            raise exception.Error(
-                _("LUN unexport failed: %(code)d, %(message)s") % resp)
+        except Exception:
+            LOG.exception(_("LUN unexport failed!"))
+            raise
 
-        self._wait_for_exportstate(volume['name'], False)
+        else:
+            self._wait_for_exportstate(volume['name'], False)
 
     def _export_snapshot(self, snapshot):
         """
@@ -426,25 +473,24 @@ class ViolinFCDriver(FibreChannelDriver):
         Returns:
             lun_id -- the LUN ID assigned by the backend
         """
+        lun_id = -1
         v = self.vmem_vip
 
         LOG.info(_("Exporting snapshot %s"), snapshot['name'])
 
-        # export the snapshot to to all initiators, since the cinder
-        # volume client will mount it direcly
-        #
-        resp = v.snapshot.export_lun_snapshot(
-            self.container, snapshot['volume_name'], snapshot['name'],
-            'all', 'all', 'auto')
+        try:
+            self._send_cmd(v.snapshot.export_lun_snapshot, '',
+                           self.container, snapshot['volume_name'],
+                           snapshot['name'], 'all', 'all', 'auto')
 
-        if resp['code'] != 0:
-            raise exception.Error(
-                _('Snapshot export failed: %(code)d, %(message)s') % resp)
+        except Exception:
+            LOG.exception(_("Snapshot export failed!"))
+            raise
 
-        self._wait_for_exportstate(snapshot['name'], True)
-
-        lun_id = self._get_snapshot_id(snapshot['volume_name'],
-                                       snapshot['name'])
+        else:
+            self._wait_for_exportstate(snapshot['name'], True)
+            lun_id = self._get_snapshot_id(snapshot['volume_name'],
+                                           snapshot['name'])
 
         return lun_id
 
@@ -465,15 +511,17 @@ class ViolinFCDriver(FibreChannelDriver):
 
         LOG.info(_("Unexporting snapshot %s"), snapshot['name'])
 
-        resp = v.snapshot.unexport_lun_snapshot(
-            self.container, snapshot['volume_name'], snapshot['name'],
-            'all', 'all', 'auto', False)
+        try:
+            self._send_cmd(v.snapshot.unexport_lun_snapshot, '',
+                           self.container, snapshot['volume_name'],
+                           snapshot['name'], 'all', 'all', 'auto', False)
 
-        if resp['code'] != 0:
-            raise exception.Error(
-                _("Snapshot unexport failed: %(code)d, %(message)s") % resp)
+        except Exception:
+            LOG.exception(_("Snapshot export failed!"))
+            raise
 
-        self._wait_for_exportstate(snapshot['name'], False)
+        else:
+            self._wait_for_exportstate(snapshot['name'], False)
 
     def _add_igroup_member(self, connector):
         """
@@ -554,7 +602,7 @@ class ViolinFCDriver(FibreChannelDriver):
             return True
         return False
 
-    def _send_cmd(self, request_func, success_msg, exception_msg, *args):
+    def _send_cmd(self, request_func, success_msg, *args):
         """
         Run an XG request function, and retry every 0-5 seconds until the
         request returns a success message, a failure message, or the global
@@ -567,8 +615,16 @@ class ViolinFCDriver(FibreChannelDriver):
         there is no space left, or other "fatal" errors are returned
         (see _fatal_error_code() for a list of all known error
         conditions).
+
+        Arguments:
+            request_func    -- XG api method to call
+            success_msg     -- Success message expected from the backend
+            *args           -- argument array to be passed to the request_func
+
+        Returns:
+            The response dict from the last XG call.
         """
-        resp = ""
+        resp = {}
         start = time.time()
 
         while True:
@@ -579,15 +635,14 @@ class ViolinFCDriver(FibreChannelDriver):
             resp = request_func(*args)
 
             if not resp['message']:
-                resp['message'] = '<no data>'
+                # XG requests will return None for a message if no message
+                # string is passed int the raw response
+                resp['message'] = ''
 
-            if resp['code'] == 0 and success_msg in resp['message']:
+            if not resp['code'] and success_msg in resp['message']:
                 break
 
-            if self._fatal_error_code(resp):
-                raise exception.Error(_('%s: %d, %s') %
-                                      (exception_msg, resp['code'],
-                                       resp['message']))
+            self._fatal_error_code(resp)
 
         return resp
 
@@ -712,13 +767,8 @@ class ViolinFCDriver(FibreChannelDriver):
         v = self.vmem_vip.basic
         active_gw_fcp_wwns = []
 
-        # TODO(rdl): just hardcode 1/2? Not sure the reason for future
-        # proofing at the cost of an extra XG request
-        #
-        ids = v.get_node_values('/vshare/state/global/*')
-
-        for i in ids:
-            bn = "/vshare/state/global/%d/target/fc/**" % ids[i]
+        for i in self.gateway_ids:
+            bn = "/vshare/state/global/%d/target/fc/**" % self.gateway_ids[i]
             resp = v.get_node_values(bn)
 
             for node in resp:
@@ -744,7 +794,7 @@ class ViolinFCDriver(FibreChannelDriver):
         output = []
         for w in wwns:
             output.append('wwn.{0}'.format(
-                    ':'.join(w[x:x + 2] for x in xrange(0, len(w), 2))))
+                ':'.join(w[x:x + 2] for x in xrange(0, len(w), 2))))
         return output
 
     def _convert_wwns_vmem_to_openstack(self, wwns):
@@ -763,42 +813,59 @@ class ViolinFCDriver(FibreChannelDriver):
         #
         output = []
         for w in wwns:
-            output.append(string.join(w[4:].split(':'), ''))
+            output.append(''.join(w[4:].split(':')))
         return output
 
     def _fatal_error_code(self, response):
         """
-           Check the error code in a XG response for a fatal error.
+           Check the error code in a XG response for a fatal error,
+           and returns an appropriate exception.  Error codes extracted
+           from vdmd_mgmt.c.
 
            Arguments:
                response: a response dict result from an XG request
-
-           Returns:
-               True - if a fatal error code was found
-               False - no fatal error code
         """
-        # known fatal response codes (as seen in vdmd_mgmt.c)
-        #
-        error_codes = {14000: 'lc_generic_error',
-                       14002: 'lc_err_assertion_failed',
-                       14004: 'lc_err_not_found',
-                       14005: 'lc_err_exists',
-                       14008: 'lc_err_unexpected_arg',
-                       14014: 'lc_err_io_error',
-                       14016: 'lc_err_io_closed',
-                       14017: 'lc_err_io_timeout',
-                       14021: 'lc_err_unexpected_case',
-                       14025: 'lc_err_no_fs_space',
-                       14035: 'lc_err_range',
-                       14036: 'lc_err_invalid_param',
-                       14121: 'lc_err_cancelled_error'}
-
         # known non-fatal response codes
         #
         retry_codes = {1024: 'lun deletion in progress, try again later',
                        14032: 'lc_err_lock_busy'}
 
-        if response['code'] in error_codes:
-            return True
-
-        return False
+        if response['code'] == 14000:
+            # lc_generic_error
+            raise ViolinBackendErr(message=response['message'])
+        elif response['code'] == 14002:
+            # lc_err_assertion_failed
+            raise ViolinBackendErr(message=response['message'])
+        elif response['code'] == 14004:
+            # lc_err_not_found
+            raise ViolinBackendErrNotFound()
+        elif response['code'] == 14005:
+            # lc_err_exists
+            raise ViolinBackendErrExists()
+        elif response['code'] == 14008:
+            # lc_err_unexpected_arg
+            raise ViolinBackendErr(message=response['message'])
+        elif response['code'] == 14014:
+            # lc_err_io_error
+            raise ViolinBackendErr(message=response['message'])
+        elif response['code'] == 14016:
+            # lc_err_io_closed
+            raise ViolinBackendErr(message=response['message'])
+        elif response['code'] == 14017:
+            # lc_err_io_timeout
+            raise ViolinBackendErr(message=response['message'])
+        elif response['code'] == 14021:
+            # lc_err_unexpected_case
+            raise ViolinBackendErr(message=response['message'])
+        elif response['code'] == 14025:
+            # lc_err_no_fs_space
+            raise ViolinBackendErr(message=response['message'])
+        elif response['code'] == 14035:
+            # lc_err_range
+            raise ViolinBackendErr(message=response['message'])
+        elif response['code'] == 14036:
+            # lc_err_invalid_param
+            raise ViolinBackendErr(message=response['message'])
+        elif response['code'] == 14121:
+            # lc_err_cancelled_err
+            raise ViolinBackendErr(message=response['message'])
