@@ -175,5 +175,6 @@ class XGEvent(XGRequest):
 
 
 class XGSet(XGRequest):
-    def __init__(self, *args, **kwargs):
-        raise Exception("Not yet implemented.")
+    def __init__(self, nodes=[], flat=False, values_only=False):
+        super(XGSet, self).__init__('set', nodes,
+                                    flat=flat, values_only=values_only)

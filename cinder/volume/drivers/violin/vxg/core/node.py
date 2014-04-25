@@ -326,6 +326,30 @@ class XGNode(object):
 
         return ret_val
 
+    @classmethod
+    def copy(cls, src):
+        """Creates a copy of the given XGNode. """
+        if not isinstance(src, XGNode):
+            raise ValueError('Expecting XGNode, got {0}'.format(
+                             src.__class__.__name__))
+        return cls(src.name, src.type, src.value, src.node_id,
+                   src.nodes, src.flags, src.subop, src.attrs)
+
+    def __eq__(self, other):
+        """Is this XGNode equal to the other or not. """
+        for field in ('name', 'type', 'value', 'node_id',
+                      'nodes', 'flags', 'subop', 'attrs'):
+            try:
+                if getattr(self, field) != getattr(other, field):
+                    return False
+            except AttributeError as e:
+                raise ValueError('{0} field missing'.format(field))
+        return True
+
+    def __ne__(self, other):
+        """Is this XGNode not equal to the other or not. """
+        return not self.__eq__(other)
+
 
 class XGNodeDict(object):
     """
@@ -346,7 +370,8 @@ class XGNodeDict(object):
         self.__values_only = values_only
 
         # Internal variable to track user modifications
-        self.__updates = set()
+        self.__added = set()
+        self.__originals = {}
 
         # Set the data as appropriate
         self.__data = {}
@@ -364,8 +389,10 @@ class XGNodeDict(object):
         if key not in self.__data:
             raise KeyError(key)
         else:
-            del(self.__data[key])
-            self.__updates.discard(key)
+            node = self.__data.pop(key)
+            if node.name not in self.__added:
+                self.__originals.setdefault(key, XGNode.copy(node))
+            self.__added.discard(key)
 
     def __iter__(self):
         """Returns an iterator for the keys in this mapping. """
@@ -415,11 +442,13 @@ class XGNodeDict(object):
         if key not in self.__data:
             raise KeyError(key)
         else:
+            if key not in self.__added:
+                # Modifying a pre-existing node, copy original value
+                self.__originals.setdefault(key, XGNode.copy(self.__data[key]))
             if self.__values_only:
                 if isinstance(value, XGNode):
                     raise ValueError('Expecting non-XGNode value')
                 self.__data[key].value = value
-                self.__updates.add(key)
             else:
                 if not isinstance(value, XGNode):
                     raise ValueError('Expecting XGNode, got {0}'.format(
@@ -431,7 +460,6 @@ class XGNodeDict(object):
                                      'desired values')
                 else:
                     self.__data[key] = value
-                    self.__updates.add(key)
 
     def __contains__(self, key):
         """Returns boolean specifying if the key is in this mapping. """
@@ -463,13 +491,15 @@ class XGNodeDict(object):
             if node.name in self.__data:
                 raise KeyError(node.name)
             else:
+                if node.name not in self.__originals:
+                    # This is a new node, not re-adding a deleted node
+                    self.__added.add(node.name)
                 self.__data[node.name] = node
-                self.__updates.add(node.name)
 
     def clear(self):
         """Resets this mapping's data and base. """
-        self.__data = {}
-        self.__updates.clear()
+        for key in self.__data:
+            self.__delitem__(key)
 
     def keys(self):
         """Returns the XGNodeDict keys. """
@@ -511,6 +541,8 @@ class XGNodeDict(object):
         does not exist.
 
         """
+        if key not in self.__data:
+            raise KeyError(key)
         return self.get(key, default)
 
     def iterkeys(self):
@@ -533,12 +565,11 @@ class XGNodeDict(object):
         if key not in self.__data:
             raise KeyError(key)
         else:
-            popped_item = self.__data.pop(key)
-            self.__updates.discard(key)
-            if self.__values_only:
-                return popped_item.value
-            else:
-                return popped_item
+            node = self.__data.pop(key)
+            if node.name not in self.__added:
+                self.__originals.setdefault(key, XGNode.copy(node))
+            self.__added.discard(key)
+            return node.value if self.__values_only else node
 
     def values(self):
         """
@@ -586,3 +617,37 @@ class XGNodeDict(object):
     def iteritems(self):
         """Returns an iterator for the list of (key, value) tuples. """
         return iter(self.items())
+
+    def get_updates(self):
+        """
+        Get the updates to this XGNodeDict as a list of XGNode objects.
+
+        Returns:
+            A list of XGNode objects.
+
+        """
+        # The list of nodes that represent changes to this XGNodeDict object
+        nodes = []
+
+        # Get updated nodes first
+        for key in self.__originals:
+            try:
+                if self.__data[key] != self.__originals[key]:
+                    # Updated node
+                    nodes.append(XGNode.copy(self.__data[key]))
+            except KeyError:
+                # Deleted node
+                node = XGNode.copy(self.__originals[key])
+                node.subop = 'delete'
+                nodes.append(node)
+
+        # Get added nodes next
+        nodes.extend(XGNode.copy(self.__data[k]) for k in self.__added)
+
+        # Return the node list
+        return nodes
+
+    def clear_updates(self):
+        """ Clear the updates to this XGNodeDict. """
+        self.__added.clear()
+        self.__originals.clear()

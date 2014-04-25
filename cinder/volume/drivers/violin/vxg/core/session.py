@@ -320,6 +320,40 @@ class XGSession(object):
         resp = self.send_request(req)
         return resp.as_action_result()
 
+    def perform_set(self, nodes=[]):
+        """
+        Performs a 'set' using the nodes specified and returns the result.
+
+        Arguments:
+            nodes -- The relevant nodes (list or XGNodeDict)
+
+        Returns:
+            A dict of the return code and message.
+
+        """
+        # Input validation
+        try:
+            # Works for XGNodeDict input
+            set_nodes = nodes.get_updates()
+        except (AttributeError, TypeError):
+            # Assume list instead
+            set_nodes = nodes
+        if not isinstance(set_nodes, list):
+            raise ValueError('Expecting nodes to be of type list')
+        else:
+            for x in set_nodes:
+                if not isinstance(x, XGNode):
+                    raise ValueError('Invalid node: {0}'.format(x.__class__))
+
+        req = XGSet(set_nodes)
+        resp = self.send_request(req)
+        try:
+            # Works for XGNodeDict input, clear the tracked modifications
+            nodes.clear_updates()
+        except (AttributeError, TypeError):
+            pass
+        return resp.as_action_result()
+
     def get_node_tree(self, node_names, nostate=False, noconfig=False):
         raise Exception("Not yet implemented.")
 

@@ -35,8 +35,11 @@ import time
 import unittest
 
 # TODO(rdl): import and use test utils (cinder.tests.utils)
+from cinder import context
 from cinder.db.sqlalchemy import models
 from cinder import exception
+from cinder.volume import volume_types
+
 from cinder.volume.drivers.violin import vxg
 from cinder.volume.drivers.violin.vxg.core.node import XGNode
 from cinder.volume.drivers.violin.vxg.core.session import XGSession
@@ -70,6 +73,7 @@ class testViolinFC(unittest.TestCase):
         self.config.gateway_user = 'admin'
         self.config.gateway_password = ''
         self.config.gateway_fcp_igroup_name = 'openstack'
+        self.config.volume_backend_name = 'violin'
         self.driver = violin.ViolinFCDriver(configuration=self.config)
         self.driver.vmem_vip = self.m_conn
         self.driver.vmem_mga = self.m_conn
@@ -132,9 +136,6 @@ class testViolinFC(unittest.TestCase):
         self.m.VerifyAll()
 
     def testCheckForSetupError(self):
-        bn_igroup = {"/vshare/config/igroup/openstack": "openstack"}
-        self.m_conn.basic.get_node_values(mox.IsA(str)
-                                          ).AndReturn(bn_igroup)
         self.m.ReplayAll()
         self.assertTrue(self.driver.check_for_setup_error() is None)
         self.m.VerifyAll()
@@ -151,20 +152,9 @@ class testViolinFC(unittest.TestCase):
         self.assertRaises(violin.InvalidBackendConfig,
                           self.driver.check_for_setup_error)
 
-    def testCheckForSetupError_NoIgroupConfig(self):
-        '''igroup config binding is empty '''
-        self.m_conn.basic.get_node_values(mox.IsA(str)).AndReturn({})
-        self.m.ReplayAll()
-        self.assertRaises(violin.InvalidBackendConfig,
-                          self.driver.check_for_setup_error)
-        self.m.VerifyAll()
-
     def testCheckForSetupError_NoWWNConfig(self):
         '''no wwns were found during setup '''
-        bn_igroup = {"/vshare/config/igroup/openstack": "openstack"}
         self.driver.gateway_fc_wwns = []
-        self.m_conn.basic.get_node_values(mox.IsA(str)
-                                          ).AndReturn(bn_igroup)
         self.m.ReplayAll()
         self.assertRaises(violin.InvalidBackendConfig,
                           self.driver.check_for_setup_error)
@@ -256,13 +246,16 @@ class testViolinFC(unittest.TestCase):
     def testInitializeConnection(self):
         lun_id = 1
         vol = self.volume1
+        igroup = 'test-igroup-1'
         connector = {'wwpns': [u'50014380186b3f65', u'50014380186b3f67']}
         self.m.StubOutWithMock(self.driver, '_login')
+        self.m.StubOutWithMock(self.driver, '_get_igroup')
         self.m.StubOutWithMock(self.driver, '_export_lun')
         self.m.StubOutWithMock(self.driver, '_add_igroup_member')
         self.driver._login()
-        self.driver._export_lun(vol).AndReturn(lun_id)
-        self.driver._add_igroup_member(connector)
+        self.driver._get_igroup(vol).AndReturn(igroup)
+        self.driver._export_lun(vol, igroup).AndReturn(lun_id)
+        self.driver._add_igroup_member(connector, igroup)
         self.m_conn.basic.save_config()
         self.m.ReplayAll()
         props = self.driver.initialize_connection(vol, connector)
@@ -275,14 +268,17 @@ class testViolinFC(unittest.TestCase):
 
     def testInitializeConnection_SnapshotObject(self):
         lun_id = 1
-        connector = {'wwpns': [u'50014380186b3f65', u'50014380186b3f67']}
+        igroup = 'test-igroup-1'
         snap = self.snapshot1
+        connector = {'wwpns': [u'50014380186b3f65', u'50014380186b3f67']}
         self.m.StubOutWithMock(self.driver, '_login')
+        self.m.StubOutWithMock(self.driver, '_get_igroup')
         self.m.StubOutWithMock(self.driver, '_export_snapshot')
         self.m.StubOutWithMock(self.driver, '_add_igroup_member')
         self.driver._login()
-        self.driver._export_snapshot(snap).AndReturn(lun_id)
-        self.driver._add_igroup_member(connector)
+        self.driver._get_igroup(snap).AndReturn(igroup)
+        self.driver._export_snapshot(snap, igroup).AndReturn(lun_id)
+        self.driver._add_igroup_member(connector, igroup)
         self.m_conn.basic.save_config()
         self.m.ReplayAll()
         props = self.driver.initialize_connection(snap, connector)
@@ -331,11 +327,30 @@ class testViolinFC(unittest.TestCase):
     def testCreateLun(self):
         volume = {'name': 'vol-01', 'size': '1'}
         response = {'code': 0, 'message': 'LUN create: success!'}
+        self.m.StubOutWithMock(self.driver, '_get_volume_type_extra_spec')
         self.m.StubOutWithMock(self.driver, '_send_cmd')
+        self.driver._get_volume_type_extra_spec(volume, 'lun_type')
         self.driver._send_cmd(self.m_conn.lun.create_lun,
                               mox.IsA(str),
                               self.driver.container, volume['name'],
                               volume['size'], 1, "0", "0", "w", 1,
+                              512).AndReturn(response)
+        self.m.ReplayAll()
+        self.assertTrue(self.driver._create_lun(volume) is None)
+        self.m.VerifyAll()
+
+    def testCreateLun_WithLunTypeOverride(self):
+        lun_type = 'thin'
+        volume = {'name': 'vol-01', 'size': '1'}
+        response = {'code': 0, 'message': 'LUN create: success!'}
+        self.m.StubOutWithMock(self.driver, '_get_volume_type_extra_spec')
+        self.m.StubOutWithMock(self.driver, '_send_cmd')
+        self.driver._get_volume_type_extra_spec(
+            volume, 'lun_type').AndReturn(lun_type)
+        self.driver._send_cmd(self.m_conn.lun.create_lun,
+                              mox.IsA(str),
+                              self.driver.container, volume['name'],
+                              volume['size'], 1, "0", "1", "w", 1,
                               512).AndReturn(response)
         self.m.ReplayAll()
         self.assertTrue(self.driver._create_lun(volume) is None)
@@ -383,6 +398,7 @@ class testViolinFC(unittest.TestCase):
     def testExportLun(self):
         volume = self.volume1
         lun_id = 1
+        igroup = 'test-igroup-1'
         response = {'code': 0, 'message': ''}
         self.m.StubOutWithMock(self.driver, '_send_cmd')
         self.m.StubOutWithMock(self.driver, '_wait_for_exportstate')
@@ -390,13 +406,15 @@ class testViolinFC(unittest.TestCase):
         self.driver._send_cmd(self.m_conn.lun.export_lun,
                               mox.IsA(str),
                               self.driver.container, volume['name'],
-                              'all', self.config.gateway_fcp_igroup_name,
-                              'auto').AndReturn(response)
+                              'all', igroup, 'auto').AndReturn(response)
         self.driver._wait_for_exportstate(volume['name'], True)
         self.driver._get_lun_id(volume['name']).AndReturn(lun_id)
         self.m.ReplayAll()
-        self.assertEqual(self.driver._export_lun(volume), lun_id)
+        self.assertEqual(self.driver._export_lun(volume, igroup), lun_id)
         self.m.VerifyAll()
+
+    # TODO(rdl) missing tests
+    #def testExportLun_WithException
 
     def testUnexportLun(self):
         volume = self.volume1
@@ -413,56 +431,57 @@ class testViolinFC(unittest.TestCase):
         self.assertTrue(self.driver._unexport_lun(volume) is None)
         self.m.VerifyAll()
 
+    # TODO(rdl) missing tests
+    #def testExportSnapshot(self):
+    #def testUnExportSnapshot(self):
+
     def testAddIgroupMember(self):
+        volume = self.volume1
+        igroup = 'test-group-1'
         connector = {'wwpns': [u'50014380186b3f65', u'50014380186b3f67']}
         wwpns = ['wwn.50:01:43:80:18:6b:3f:65', 'wwn.50:01:43:80:18:6b:3f:67']
         response = {'code': 0, 'message': 'success'}
         self.m.StubOutWithMock(self.driver, '_convert_wwns_openstack_to_vmem')
         self.driver._convert_wwns_openstack_to_vmem(
             connector['wwpns']).AndReturn(wwpns)
-        self.m_conn.igroup.add_initiators(mox.IsA(str),
+        self.m_conn.igroup.add_initiators(igroup,
                                           wwpns).AndReturn(response)
         self.m.ReplayAll()
-        self.assertTrue(self.driver._add_igroup_member(connector) is None)
+        self.assertTrue(self.driver._add_igroup_member(connector, igroup)
+                        is None)
         self.m.VerifyAll()
 
     def testUpdateStats(self):
-        alloc_bytes = 0
-        backend_string = "V6000"
-        vendor_string = "Violin Memory, Inc."
+        backend_name = self.config.volume_backend_name
+        vendor_name = "Violin Memory, Inc."
         tot_bytes = 100 * 1024 * 1024 * 1024
+        free_bytes = 50 * 1024 * 1024 * 1024
         bn1 = "/vshare/state/global/1/container/myContainer/total_bytes"
-        bn2 = "/vshare/state/global/1/container/myContainer/alloc_bytes"
-        bn3 = "/media/state/array/myContainer/chassis/system/type"
-        bn4 = "/hwinfo/state/system_mfr"
-        response = {
-            bn1: tot_bytes,
-            bn2: alloc_bytes,
-            bn3: backend_string,
-            bn4: vendor_string}
-        self.m_conn.basic.get_node_values([bn1, bn2, bn3, bn4]
-                                          ).AndReturn(response)
+        bn2 = "/vshare/state/global/1/container/myContainer/free_bytes"
+        response = {bn1: tot_bytes, bn2: free_bytes}
+        self.m_conn.basic.get_node_values([bn1, bn2]).AndReturn(response)
         self.m.ReplayAll()
         self.assertTrue(self.driver._update_stats() is None)
         self.assertEqual(self.driver.stats['total_capacity_gb'], 100)
-        self.assertEqual(self.driver.stats['free_capacity_gb'], 100)
+        self.assertEqual(self.driver.stats['free_capacity_gb'], 50)
         self.assertEqual(self.driver.stats['volume_backend_name'],
-                         backend_string)
-        self.assertEqual(self.driver.stats['vendor_name'], vendor_string)
+                         backend_name)
+        self.assertEqual(self.driver.stats['vendor_name'], vendor_name)
         self.m.VerifyAll()
 
     def testUpdateStats_DataQueryFails(self):
+        backend_name = self.config.volume_backend_name
+        vendor_name = "Violin Memory, Inc."
         bn1 = "/vshare/state/global/1/container/myContainer/total_bytes"
-        bn2 = "/vshare/state/global/1/container/myContainer/alloc_bytes"
-        bn3 = "/media/state/array/myContainer/chassis/system/type"
-        bn4 = "/hwinfo/state/system_mfr"
-        self.m_conn.basic.get_node_values([bn1, bn2, bn3, bn4]).AndReturn({})
+        bn2 = "/vshare/state/global/1/container/myContainer/free_bytes"
+        self.m_conn.basic.get_node_values([bn1, bn2]).AndReturn({})
         self.m.ReplayAll()
         self.assertTrue(self.driver._update_stats() is None)
         self.assertEqual(self.driver.stats['total_capacity_gb'], "unknown")
         self.assertEqual(self.driver.stats['free_capacity_gb'], "unknown")
-        self.assertEqual(self.driver.stats['volume_backend_name'], "unknown")
-        self.assertEqual(self.driver.stats['vendor_name'], "Violin")
+        self.assertEqual(self.driver.stats['volume_backend_name'],
+                         backend_name)
+        self.assertEqual(self.driver.stats['vendor_name'], vendor_name)
         self.m.VerifyAll()
 
     def testLogin(self):
@@ -583,6 +602,59 @@ class testViolinFC(unittest.TestCase):
         self.assertEqual(self.driver._get_active_fc_targets(), result)
         self.m.VerifyAll()
 
+    def testGetIgroup(self):
+        volume = self.volume1
+        bn = '/vshare/config/igroup/%s' % self.config.gateway_fcp_igroup_name
+        resp = {bn: self.config.gateway_fcp_igroup_name}
+        self.m.StubOutWithMock(self.driver, '_get_volume_type_extra_spec')
+        self.driver._get_volume_type_extra_spec(volume, 'igroup')
+        self.m_conn.basic.get_node_values(bn).AndReturn(resp)
+        self.m.ReplayAll()
+        self.assertEqual(self.driver._get_igroup(volume),
+                         self.config.gateway_fcp_igroup_name)
+        self.m.VerifyAll()
+
+    def testGetIgroup_WithIgroupOverride(self):
+        volume = self.volume1
+        igroup = 'test-group-1'
+        bn = '/vshare/config/igroup/test-group-1'
+        resp = {bn: 'test-group-1'}
+        self.m.StubOutWithMock(self.driver, '_get_volume_type_extra_spec')
+        self.driver._get_volume_type_extra_spec(
+            volume, 'igroup').AndReturn(igroup)
+        self.m_conn.basic.get_node_values(bn).AndReturn(resp)
+        self.m.ReplayAll()
+        self.assertEqual(self.driver._get_igroup(volume), igroup)
+        self.m.VerifyAll()
+
+    def testGetIgroup_WithNewName(self):
+        volume = self.volume1
+        bn = '/vshare/config/igroup/%s' % self.config.gateway_fcp_igroup_name
+        resp = {}
+        self.m.StubOutWithMock(self.driver, '_get_volume_type_extra_spec')
+        self.driver._get_volume_type_extra_spec(volume, 'igroup')
+        self.m_conn.basic.get_node_values(bn).AndReturn(resp)
+        self.m_conn.igroup.create_igroup(
+            self.config.gateway_fcp_igroup_name)
+        self.m.ReplayAll()
+        self.assertEqual(self.driver._get_igroup(volume),
+                         self.config.gateway_fcp_igroup_name)
+        self.m.VerifyAll()
+
+    def testGetIgroup_WithIgroupOverrideAndNewName(self):
+        volume = self.volume1
+        igroup = 'test-group-1'
+        bn = '/vshare/config/igroup/test-group-1'
+        resp = {}
+        self.m.StubOutWithMock(self.driver, '_get_volume_type_extra_spec')
+        self.driver._get_volume_type_extra_spec(
+            volume, 'igroup').AndReturn(igroup)
+        self.m_conn.basic.get_node_values(bn).AndReturn(resp)
+        self.m_conn.igroup.create_igroup(igroup)
+        self.m.ReplayAll()
+        self.assertEqual(self.driver._get_igroup(volume), igroup)
+        self.m.VerifyAll()
+
     def testConvertWWNsOpenstackToVMEM(self):
         vmem_wwns = ['wwn.50:01:43:80:18:6b:3f:65']
         openstack_wwns = ['50014380186b3f65']
@@ -594,6 +666,51 @@ class testViolinFC(unittest.TestCase):
         openstack_wwns = ['50014380186b3f65']
         result = self.driver._convert_wwns_vmem_to_openstack(vmem_wwns)
         self.assertEqual(result, openstack_wwns)
+
+    def testGetVolumeTypeExtraSpec(self):
+        volume = {'volume_type_id': 1}
+        volume_type = {'extra_specs': {'override:test_key': 'test_value'}}
+        self.m.StubOutWithMock(context, 'get_admin_context')
+        self.m.StubOutWithMock(volume_types, 'get_volume_type')
+        context.get_admin_context().AndReturn(None)
+        volume_types.get_volume_type(None, 1).AndReturn(volume_type)
+        self.m.ReplayAll()
+        result = self.driver._get_volume_type_extra_spec(volume, 'test_key')
+        self.assertEqual(result, 'test_value')
+        self.m.VerifyAll()
+
+    def testGetVolumeTypeExtraSpec_NoVolumeType(self):
+        volume = {'volume_type_id': None}
+        self.m.StubOutWithMock(context, 'get_admin_context')
+        context.get_admin_context().AndReturn(None)
+        self.m.ReplayAll()
+        result = self.driver._get_volume_type_extra_spec(volume, 'test_key')
+        self.assertEqual(result, None)
+        self.m.VerifyAll()
+
+    def testGetVolumeTypeExtraSpec_NoExtraSpecs(self):
+        volume = {'volume_type_id': 1}
+        volume_type = {'extra_specs': {}}
+        self.m.StubOutWithMock(context, 'get_admin_context')
+        self.m.StubOutWithMock(volume_types, 'get_volume_type')
+        context.get_admin_context().AndReturn(None)
+        volume_types.get_volume_type(None, 1).AndReturn(volume_type)
+        self.m.ReplayAll()
+        result = self.driver._get_volume_type_extra_spec(volume, 'test_key')
+        self.assertEqual(result, None)
+        self.m.VerifyAll()
+
+    def testGetVolumeTypeExtraSpec_NoOverridePrefixInExtraSpecKey(self):
+        volume = {'volume_type_id': 1}
+        volume_type = {'extra_specs': {'test_key': 'test_value'}}
+        self.m.StubOutWithMock(context, 'get_admin_context')
+        self.m.StubOutWithMock(volume_types, 'get_volume_type')
+        context.get_admin_context().AndReturn(None)
+        volume_types.get_volume_type(None, 1).AndReturn(volume_type)
+        self.m.ReplayAll()
+        result = self.driver._get_volume_type_extra_spec(volume, 'test_key')
+        self.assertEqual(result, 'test_value')
+        self.m.VerifyAll()
 
     def testFatalErrorCode(self):
         # NYI
