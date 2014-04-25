@@ -38,8 +38,8 @@ Setup
 
 6. Restart cinder-volume.
 
-Configuration with iSCSI
-------------------------
+Basic Configuration with iSCSI
+------------------------------
 
 You will need to alter your cinder configuation, typically in
 /etc/cinder/cinder.conf.
@@ -86,8 +86,8 @@ Note: if you add the configuration option 'verbose=True' and/or
 'debug=True' to cinder.conf, you will receive helpful logging from the
 Violin driver in /var/log/cinder/cinder-volume.log.
 
-Configuration with FibreChannel
--------------------------------
+Basic Configuration with FibreChannel
+-------------------------------------
 You will need to alter your cinder configuation, typically in
 /etc/cinder/cinder.conf.
 
@@ -126,6 +126,52 @@ look like this:
 Note: if you add the configuration option 'verbose=True' and/or
 'debug=True' to cinder.conf, you will receive helpful logging from the
 Violin driver in /var/log/cinder/cinder-volume.log.
+
+Additional Configuration for Multibackend
+-----------------------------------------
+*Multibackend is currently only available for the FCP driver.*
+
+This setup is specifically for users who want to use multiple storage
+drivers on their cinder-volume nodes.  In this case *each* driver
+instance must have a different configuration section with a unique
+name and configuration.  The driver section names must then be added
+to the default configuration section using the enabled_backends key.
+
+For example, to add a multi-backend configuration section for the
+violin FCP driver, you might do the following:
+
+    [violin-1]
+    volume_backend_name=VMEM_FCP
+    volume_driver=cinder.volume.drivers.violin.violin_fc.ViolinFCDriver
+    gateway_vip=1.2.3.4
+    gateway_mga=1.2.3.5
+    gateway_mgb=1.2.3.6
+
+    [DEFAULT]
+    enabled_backends=violin-1
+
+Further information can be found in the Openstack Cloud Administrator
+Guide at
+http://docs.openstack.org/admin-guide-cloud/content/multi_backend.html.
+
+Additional Configuration for iGroup/lun_type Overrides
+------------------------------------------------------
+*Overrides are currently only available for the FCP driver.*
+
+igroup:
+    To associate a specific igroup name to allocate luns to,
+    you can include the 'igroup' setting with your volume_type.
+    If the igroup does not exist on the backend, it will be
+    created automatically.
+
+    Ex. 'cinder type-key violin set override:igroup=my-vmem-igroup'
+
+lun_type:
+    To set your volume_type to allocate thin luns instead of thick
+    (thick is the default), you can include the 'lun_type' setting
+    with your volume_type.
+
+    Ex. 'cinder type-key violin set override:lun_type=thin'
 
 Questions?
 ----------
