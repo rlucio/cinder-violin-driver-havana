@@ -39,23 +39,6 @@ Copy Image to Volume:           YES*
 Copy Volume to Image:           YES*
 
 * functionality inherited from base class driver
-
-Supported extra_specs:
-----------------------
-igroup:
-    To associate a specific igroup name to allocate luns to,
-    you can include the 'igroup' setting with your volume_type.
-    If the igroup does not exist on the backend, it will be
-    created automatically.
-
-    Ex. 'cinder type-key violin set override:igroup=my-vmem-igroup'
-
-lun_type:
-    To set your volume_type to allocate thin luns instead of thick
-    (thick is the default), you can include the 'lun_type' setting
-    with your volume_type.
-
-    Ex. 'cinder type-key violin set override:lun_type=thin'
 """
 
 import random
@@ -115,9 +98,12 @@ violin_opts = [
                default='',
                help='User name for connecting to the Memory Gateway',
                secret=True),
-    cfg.StrOpt('gateway_fcp_igroup_name',
-               default='openstack',
-               help='name of default igroup for initiators'), ]
+    cfg.BoolOpt('use_igroups',
+                default=False,
+                help='Use igroups to manage targets and initiators'),
+    cfg.BoolOpt('use_thin_luns',
+                default=False,
+                help='Use thin luns instead of thick luns'), ]
 
 CONF = cfg.CONF
 CONF.register_opts(violin_opts)
@@ -268,23 +254,36 @@ class ViolinFCDriver(FibreChannelDriver):
         """Initializes the connection (target<-->initiator) """
         self._login()
 
-        # igroup must be fetched/setup first, so that both
-        # targets and initiators will be in the right bucket
-        #
-        igroup = self._get_igroup(volume)
+        igroup = None
+
+        if self.config.use_igroups:
+            #
+            # Most drivers don't use igroups, because there are a
+            # number of issues with multipathing and iscsi/fcp where
+            # lun devices either aren't cleaned up properly or are
+            # stale (from previous scans).
+            #
+            # If the customer really wants igroups for whatever
+            # reason, we create a new igroup for each host/hypervisor.
+            # Every lun that is exported to the particular
+            # hypervisor/host will be contained in this igroup.  This
+            # should prevent other hosts from seeing luns they aren't
+            # using when they perform scans.
+            #
+            igroup = self._get_igroup(volume, connector)
+            self._add_igroup_member(connector, igroup)
 
         if isinstance(volume, models.Volume):
-            lun = self._export_lun(volume, igroup)
+            lun_id = self._export_lun(volume, connector, igroup)
         else:
-            lun = self._export_snapshot(volume, igroup)
+            lun_id = self._export_snapshot(volume, connector, igroup)
 
-        self._add_igroup_member(connector, igroup)
         self.vmem_vip.basic.save_config()
 
         properties = {}
         properties['target_discovered'] = True
         properties['target_wwn'] = self.gateway_fc_wwns
-        properties['target_lun'] = lun
+        properties['target_lun'] = lun_id
         properties['access_mode'] = 'rw'
 
         return {'driver_volume_type': 'fibre_channel', 'data': properties}
@@ -317,22 +316,17 @@ class ViolinFCDriver(FibreChannelDriver):
         Arguments:
             volume -- volume object provided by the Manager
         """
-        v = self.vmem_vip
         lun_type = '0'
+        v = self.vmem_vip
+
         LOG.info(_("Creating lun %(name)s, %(size)s GB") % volume)
 
-        # allow a user to override the lun type to use thin luns
-        # instead of thick for certain volume_types
-        #
-        lun_type_override = self._get_volume_type_extra_spec(
-            volume, 'lun_type')
-        if lun_type_override and lun_type_override == 'thin':
+        if self.config.use_thin_luns:
             lun_type = '1'
 
         # using the defaults for other fields: (quantity, nozero,
         # readonly, startnum, blksize)
         #
-
         try:
             self._send_cmd(v.lun.create_lun,
                            'LUN create: success!',
@@ -433,7 +427,7 @@ class ViolinFCDriver(FibreChannelDriver):
             LOG.exception(_("LUN snapshot delete failed!"))
             raise
 
-    def _export_lun(self, volume, igroup):
+    def _export_lun(self, volume, connector=None, igroup=None):
         """
         Generates the export configuration for the given volume
 
@@ -442,19 +436,30 @@ class ViolinFCDriver(FibreChannelDriver):
 
         Arguments:
             volume -- volume object provided by the Manager
+            connector -- connector object provided by the Manager
+            igroup -- name of igroup to use for exporting
 
         Returns:
             lun_id -- the LUN ID assigned by the backend
         """
         lun_id = -1
+        export_to = ''
         v = self.vmem_vip
+
+        if igroup:
+            export_to = igroup
+        elif connector:
+            export_to = self._convert_wwns_openstack_to_vmem(
+                connector['wwpns'])
+        else:
+            raise exception.Error(_("No initiators found, cannot proceed"))
 
         LOG.info(_("Exporting lun %s"), volume['name'])
 
         try:
             self._send_cmd(v.lun.export_lun, '',
                            self.container, volume['name'], 'all',
-                           igroup, 'auto')
+                           export_to, 'auto')
 
         except Exception:
             LOG.exception(_("LUN export failed!"))
@@ -485,6 +490,10 @@ class ViolinFCDriver(FibreChannelDriver):
                            self.container, volume['name'],
                            'all', 'all', 'auto')
 
+        except ViolinBackendErrNotFound:
+            LOG.info(_("Lun %s already unexported, continuing"),
+                     volume['name'])
+
         except Exception:
             LOG.exception(_("LUN unexport failed!"))
             raise
@@ -492,7 +501,7 @@ class ViolinFCDriver(FibreChannelDriver):
         else:
             self._wait_for_exportstate(volume['name'], False)
 
-    def _export_snapshot(self, snapshot, igroup):
+    def _export_snapshot(self, snapshot, connector=None, igroup=None):
         """
         Generates the export configuration for the given snapshot.
 
@@ -501,19 +510,34 @@ class ViolinFCDriver(FibreChannelDriver):
 
         Arguments:
             snapshot -- snapshot object provided by the Manager
+            connector -- connector object provided by the Manager
+            igroup -- name of igroup to use for exporting
 
         Returns:
             lun_id -- the LUN ID assigned by the backend
         """
         lun_id = -1
+        export_to = ''
         v = self.vmem_vip
+
+        if igroup:
+            export_to = igroup
+        elif connector:
+            export_to = self._convert_wwns_openstack_to_vmem(
+                connector['wwpns'])
+        else:
+            raise exception.Error(_("No initiators found, cannot proceed"))
 
         LOG.info(_("Exporting snapshot %s"), snapshot['name'])
 
         try:
             self._send_cmd(v.snapshot.export_lun_snapshot, '',
                            self.container, snapshot['volume_name'],
-                           snapshot['name'], igroup, 'all', 'auto')
+                           snapshot['name'], export_to, 'all', 'auto')
+
+        except ViolinBackendErrNotFound:
+            LOG.info(_("Snap %s already unexported, continuing"),
+                     volume['name'])
 
         except Exception:
             LOG.exception(_("Snapshot export failed!"))
@@ -813,7 +837,7 @@ class ViolinFCDriver(FibreChannelDriver):
 
         return self._convert_wwns_vmem_to_openstack(active_gw_fcp_wwns)
 
-    def _get_igroup(self, volume):
+    def _get_igroup(self, volume, connector):
         """
         Gets the igroup that should be used when configuring a volume
 
@@ -824,11 +848,7 @@ class ViolinFCDriver(FibreChannelDriver):
             igroup_name: name of igroup (for configuring targets & initiators)
         """
         v = self.vmem_vip
-        igroup_name = self.config.gateway_fcp_igroup_name
-
-        igroup_override = self._get_volume_type_extra_spec(volume, 'igroup')
-        if igroup_override:
-            igroup_name = igroup_override
+        igroup_name = connector['host']
 
         # verify that the igroup has been created on the backend, and
         # if it doesn't exist, create it!
