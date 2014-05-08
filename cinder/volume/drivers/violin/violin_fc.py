@@ -848,7 +848,14 @@ class ViolinFCDriver(FibreChannelDriver):
             igroup_name: name of igroup (for configuring targets & initiators)
         """
         v = self.vmem_vip
-        igroup_name = connector['host']
+
+        # Use the connector's primary hostname and use that as the
+        # name of the igroup.  The name must follow syntax rules
+        # required by the array: "must contain only alphanumeric
+        # characters, dashes, and underscores.  The first character
+        # must be alphanumeric".
+        #
+        igroup_name = re.sub(r'[\W]', '_',connector['host'])
 
         # verify that the igroup has been created on the backend, and
         # if it doesn't exist, create it!
