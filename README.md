@@ -27,16 +27,12 @@ Setup
 
     For ubuntu: 'cp -r cinder /usr/local/lib/python2.7/dist-packages/cinder'
 
-3. Create an openstack igroup on the Violin v6xxx array.
-
-    'igroup create name openstack'
-
-4. Follow your system documentation to enable FibreChannel or iSCSI
+3. Follow your system documentation to enable FibreChannel or iSCSI
    and configure your HBAs.
 
-5. Configure cinder to use one of the violin drivers (see below).
+4. Configure cinder to use one of the violin drivers (see below).
 
-6. Restart cinder-volume.
+5. Restart cinder-volume.
 
 Basic Configuration with iSCSI
 ------------------------------
@@ -71,8 +67,11 @@ default values:
     # [iSCSI only] prefix for iscsi volumes (string value)
     gateway_iscsi_target_prefix=iqn.2004-02.com.vmem:
 
-    # [iSCSI only] name of igroup for initiators (string value)
-    gateway_iscsi_igroup_name=openstack
+    # Use igroups to manage targets and initiators (bool value)
+    use_igroups=False
+
+    # Use thin luns instead of thick luns (bool value)
+    use_thin_luns=False
 
 A typical configuration file section for using the Violin driver might
 look like this:
@@ -112,8 +111,11 @@ default values:
     # value)
     gateway_password=
 
-    # [FC only] name of igroup for initiators (string value)
-    gateway_fcp_igroup_name=openstack
+    # Use igroups to manage targets and initiators (bool value)
+    use_igroups=False
+
+    # Use thin luns instead of thick luns (bool value)
+    use_thin_luns=False
 
 A typical configuration file section for using the Violin driver might
 look like this:
@@ -153,25 +155,6 @@ violin FCP driver, you might do the following:
 Further information can be found in the Openstack Cloud Administrator
 Guide at
 http://docs.openstack.org/admin-guide-cloud/content/multi_backend.html.
-
-Additional Configuration for iGroup/lun_type Overrides
-------------------------------------------------------
-*Overrides are currently only available for the FCP driver.*
-
-igroup:
-    To associate a specific igroup name to allocate luns to,
-    you can include the 'igroup' setting with your volume_type.
-    If the igroup does not exist on the backend, it will be
-    created automatically.
-
-    Ex. 'cinder type-key violin set override:igroup=my-vmem-igroup'
-
-lun_type:
-    To set your volume_type to allocate thin luns instead of thick
-    (thick is the default), you can include the 'lun_type' setting
-    with your volume_type.
-
-    Ex. 'cinder type-key violin set override:lun_type=thin'
 
 Questions?
 ----------
