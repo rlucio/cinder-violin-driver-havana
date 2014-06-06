@@ -70,14 +70,15 @@ class testViolin(unittest.TestCase):
         self.config.gateway_mgb = '3.3.3.3'
         self.config.gateway_user = 'admin'
         self.config.gateway_password = ''
-        self.config.gateway_iscsi_igroup_name = 'openstack'
+        self.config.use_thin_luns = False
+        self.config.use_igroups = False
+        self.config.volume_backend_name = 'violin'
         self.config.gateway_iscsi_target_prefix = 'iqn.2004-02.com.vmem:'
         self.driver = violin.ViolinDriver(configuration=self.config)
         self.driver.vmem_vip = self.m_conn
         self.driver.vmem_mga = self.m_conn
         self.driver.vmem_mgb = self.m_conn
         self.driver.container = 'myContainer'
-        self.driver.device_id = 'ata-VIOLIN_MEMORY_ARRAY_23109R00000022'
         self.driver.gateway_iscsi_ip_addresses_mga = '1.2.3.4'
         self.driver.gateway_iscsi_ip_addresses_mgb = '1.2.3.4'
         self.driver.array_info = [{"node": 'hostname_mga',
@@ -96,7 +97,6 @@ class testViolin(unittest.TestCase):
         self.driver.vmem_mga = None
         self.driver.vmem_mgb = None
         self.driver.container = ""
-        self.driver.device_id = ""
         self.driver.gateway_iscsi_ip_addresses_mga = ""
         self.driver.gateway_iscsi_ip_addresses_mgb = ""
         self.driver.array_info = []
@@ -112,18 +112,14 @@ class testViolin(unittest.TestCase):
         self.driver._get_active_iscsi_ips(self.m_conn).AndReturn([])
         self.m_conn.basic.get_node_values(mox.IsA(str))
         self.m_conn.basic.get_node_values(mox.IsA(str))
-        self.m_conn.basic.get_node_values(mox.IsA(str))
         self.m.ReplayAll()
         self.assertTrue(self.driver.do_setup(emptyContext) is None)
         self.m.VerifyAll()
 
     def testCheckForSetupError(self):
         bn_enable = {"/vshare/config/iscsi/enable": True}
-        bn_igroup = {"/vshare/config/igroup/openstack": "openstack"}
         self.m_conn.basic.get_node_values(mox.IsA(str)
                                           ).AndReturn(bn_enable)
-        self.m_conn.basic.get_node_values(mox.IsA(str)
-                                          ).AndReturn(bn_igroup)
         self.m.ReplayAll()
         self.assertTrue(self.driver.check_for_setup_error() is None)
         self.m.VerifyAll()
@@ -131,12 +127,6 @@ class testViolin(unittest.TestCase):
     def testCheckForSetupError_NoContainer(self):
         '''container name is empty '''
         self.driver.container = ""
-        self.assertRaises(violin.InvalidBackendConfig,
-                          self.driver.check_for_setup_error)
-
-    def testCheckForSetupError_NoDeviceId(self):
-        '''device id is empty '''
-        self.driver.device_id = ""
         self.assertRaises(violin.InvalidBackendConfig,
                           self.driver.check_for_setup_error)
 
@@ -150,24 +140,11 @@ class testViolin(unittest.TestCase):
                           self.driver.check_for_setup_error)
         self.m.VerifyAll()
 
-    def testCheckForSetupError_NoIgroupConfig(self):
-        '''igroup config binding is empty '''
-        bn_enable = {"/vshare/config/iscsi/enable": True}
-        self.m_conn.basic.get_node_values(mox.IsA(str)
-                                          ).AndReturn(bn_enable)
-        self.m_conn.basic.get_node_values(mox.IsA(str)).AndReturn({})
-        self.m.ReplayAll()
-        self.assertRaises(violin.InvalidBackendConfig,
-                          self.driver.check_for_setup_error)
-        self.m.VerifyAll()
-
     def testCheckForSetupError_NoIscsiIPsMga(self):
         '''iscsi interface binding for mg-a is empty '''
         self.driver.gateway_iscsi_ip_addresses_mga = ''
         bn_enable = {"/vshare/config/iscsi/enable": True}
-        bn_igroup = {"/vshare/config/igroup/openstack": "openstack"}
         self.m_conn.basic.get_node_values(mox.IsA(str)).AndReturn(bn_enable)
-        self.m_conn.basic.get_node_values(mox.IsA(str)).AndReturn(bn_igroup)
         self.m.ReplayAll()
         self.assertRaises(violin.InvalidBackendConfig,
                           self.driver.check_for_setup_error)
@@ -177,9 +154,7 @@ class testViolin(unittest.TestCase):
         '''iscsi interface binding for mg-a is empty '''
         self.driver.gateway_iscsi_ip_addresses_mgb = ''
         bn_enable = {"/vshare/config/iscsi/enable": True}
-        bn_igroup = {"/vshare/config/igroup/openstack": "openstack"}
         self.m_conn.basic.get_node_values(mox.IsA(str)).AndReturn(bn_enable)
-        self.m_conn.basic.get_node_values(mox.IsA(str)).AndReturn(bn_igroup)
         self.m.ReplayAll()
         self.assertRaises(violin.InvalidBackendConfig,
                           self.driver.check_for_setup_error)
@@ -206,6 +181,7 @@ class testViolin(unittest.TestCase):
         self.m.VerifyAll()
 
     def testInitializeConnection(self):
+        igroup = None
         volume = {'name': 'vol-01', 'size': '1', 'id': '12345'}
         connector = {'initiator': 'iqn.1993-08.org.debian:8d3a79542d'}
         vol = volume['name']
@@ -215,12 +191,10 @@ class testViolin(unittest.TestCase):
         self.m.StubOutWithMock(self.driver, '_get_short_name')
         self.m.StubOutWithMock(self.driver, '_create_iscsi_target')
         self.m.StubOutWithMock(self.driver, '_export_lun')
-        self.m.StubOutWithMock(self.driver, '_add_igroup_member')
         self.driver._login()
         self.driver._get_short_name(volume['name']).AndReturn(vol)
         self.driver._create_iscsi_target(volume).AndReturn(tgt)
-        self.driver._export_lun(volume).AndReturn(lun)
-        self.driver._add_igroup_member(connector)
+        self.driver._export_lun(volume, connector, igroup).AndReturn(lun)
         self.m_conn.basic.save_config()
         self.m.ReplayAll()
         props = self.driver.initialize_connection(volume, connector)
@@ -231,82 +205,151 @@ class testViolin(unittest.TestCase):
         self.assertEqual(props['data']['volume_id'], "12345")
         self.m.VerifyAll()
 
-    # TODO(rlucio): add basic tests for terminate_connection, and
-    # get_volume_stats
-    #
+    def testInitializeConnection_WithIgroupsEnabled(self):
+        self.config.use_igroups = True
+        igroup = 'test-igroup-1'
+        volume = {'name': 'vol-01', 'size': '1', 'id': '12345'}
+        connector = {'initiator': 'iqn.1993-08.org.debian:8d3a79542d'}
+        vol = volume['name']
+        tgt = self.driver.array_info[0]
+        lun = 1
+        self.m.StubOutWithMock(self.driver, '_login')
+        self.m.StubOutWithMock(self.driver, '_get_igroup')
+        self.m.StubOutWithMock(self.driver, '_add_igroup_member')
+        self.m.StubOutWithMock(self.driver, '_get_short_name')
+        self.m.StubOutWithMock(self.driver, '_create_iscsi_target')
+        self.m.StubOutWithMock(self.driver, '_export_lun')
+        self.driver._login()
+        self.driver._get_igroup(volume, connector).AndReturn(igroup)
+        self.driver._add_igroup_member(connector, igroup)
+        self.driver._get_short_name(volume['name']).AndReturn(vol)
+        self.driver._create_iscsi_target(volume).AndReturn(tgt)
+        self.driver._export_lun(volume, connector, igroup).AndReturn(lun)
+        self.m_conn.basic.save_config()
+        self.m.ReplayAll()
+        props = self.driver.initialize_connection(volume, connector)
+        self.assertEqual(props['data']['target_portal'], "1.2.3.4:3260")
+        self.assertEqual(props['data']['target_iqn'],
+                         "iqn.2004-02.com.vmem:hostname_mga:vol-01")
+        self.assertEqual(props['data']['target_lun'], lun)
+        self.assertEqual(props['data']['volume_id'], "12345")
+        self.m.VerifyAll()
+
+    def testTerminateConnection(self):
+        volume = {'name': 'vol-01', 'size': '1', 'id': '12345'}
+        connector = {'initiator': 'iqn.1993-08.org.debian:8d3a79542d'}
+        self.m.StubOutWithMock(self.driver, '_login')
+        self.m.StubOutWithMock(self.driver, '_unexport_lun')
+        self.m.StubOutWithMock(self.driver, '_delete_iscsi_target')
+        self.driver._login()
+        self.driver._unexport_lun(volume)
+        self.driver._delete_iscsi_target(volume)
+        self.m_conn.basic.save_config()
+        self.m.ReplayAll()
+        self.driver.terminate_connection(volume, connector)
+        self.m.VerifyAll()
+
+    def testGetVolumeStats(self):
+        self.m.StubOutWithMock(self.driver, '_login')
+        self.m.StubOutWithMock(self.driver, '_update_stats')
+        self.driver._login()
+        self.driver._update_stats()
+        self.m.ReplayAll()
+        self.assertEqual(self.driver.get_volume_stats(True), self.driver.stats)
+        self.m.VerifyAll()
 
     def testCreateLun(self):
         volume = {'name': 'vol-01', 'size': '1'}
-        response = {'code': 0, 'message': 'success'}
-        self.m.StubOutWithMock(self.driver, '_wait_for_lockstate')
-        self.driver._wait_for_lockstate()
-        self.m_conn.lun.create_lun(self.driver.container, volume['name'],
-                                   volume['size'], 1, "0", "0", "w", 1,
-                                   512).AndReturn(response)
+        response = {'code': 0, 'message': 'LUN create: success!'}
+        self.m.StubOutWithMock(self.driver, '_send_cmd')
+        self.driver._send_cmd(self.m_conn.lun.create_lun,
+                              mox.IsA(str),
+                              self.driver.container, volume['name'],
+                              volume['size'], 1, "0", "0", "w", 1,
+                              512).AndReturn(response)
         self.m.ReplayAll()
         self.assertTrue(self.driver._create_lun(volume) is None)
         self.m.VerifyAll()
 
-    def testDeleteLun_CreateFails(self):
+    def testCreateLun_LunAlreadyExists(self):
         volume = {'name': 'vol-01', 'size': '1'}
-        response = {'code': 1, 'message': 'fail'}
-        self.m.StubOutWithMock(self.driver, '_wait_for_lockstate')
-        self.driver._wait_for_lockstate()
-        self.m_conn.lun.create_lun(self.driver.container, volume['name'],
-                                   volume['size'], 1, "0", "0", "w", 1,
-                                   512).AndReturn(response)
-        self.driver._wait_for_lockstate()
-        self.m_conn.lun.create_lun(self.driver.container, volume['name'],
-                                   volume['size'], 1, "0", "0", "w", 1,
-                                   512).AndReturn(response)
-        self.driver._wait_for_lockstate()
-        self.m_conn.lun.create_lun(self.driver.container, volume['name'],
-                                   volume['size'], 1, "0", "0", "w", 1,
-                                   512).AndReturn(response)
+        response = {'code': 0, 'message': 'LUN create: success!'}
+        self.m.StubOutWithMock(self.driver, '_send_cmd')
+        self.driver._send_cmd(self.m_conn.lun.create_lun,
+                              mox.IsA(str),
+                              self.driver.container, volume['name'],
+                              volume['size'], 1, "0", "0", "w", 1,
+                              512).AndRaise(violin.ViolinBackendErrExists())
         self.m.ReplayAll()
-        self.assertRaises(violin.exception.Error, self.driver._create_lun,
+        self.assertTrue(self.driver._create_lun(volume) is None)
+        self.m.VerifyAll()
+
+    def testCreateLun_CreateFailsWithException(self):
+        volume = {'name': 'vol-01', 'size': '1'}
+        response = {'code': 0, 'message': 'LUN create: success!'}
+        self.m.StubOutWithMock(self.driver, '_send_cmd')
+        self.driver._send_cmd(self.m_conn.lun.create_lun,
+                              mox.IsA(str),
+                              self.driver.container, volume['name'],
+                              volume['size'], 1, "0", "0", "w", 1,
+                              512).AndRaise(violin.ViolinBackendErr('failed'))
+        self.m.ReplayAll()
+        self.assertRaises(violin.ViolinBackendErr, self.driver._create_lun,
                           volume)
         self.m.VerifyAll()
 
     def testDeleteLun(self):
         volume = {'name': 'vol-01', 'size': '1'}
-        response = {'code': 0, 'message': 'success'}
-        self.m.StubOutWithMock(self.driver, '_wait_for_lockstate')
-        self.driver._wait_for_lockstate()
-        self.m_conn.lun.bulk_delete_luns(mox.IsA(str),
-                                         mox.IsA(str)).AndReturn(response)
+        response = {'code': 0, 'message': 'LUN deletion started'}
+        self.m.StubOutWithMock(self.driver, '_send_cmd')
+        self.driver._send_cmd(self.m_conn.lun.bulk_delete_luns,
+                              mox.IsA(str),
+                              self.driver.container,
+                              volume['name']).AndReturn(response)
         self.m.ReplayAll()
         self.assertTrue(self.driver._delete_lun(volume) is None)
         self.m.VerifyAll()
 
-    def testDeleteLun_DeleteFails(self):
+    def testDeleteLun_LunAlreadyDeleted(self):
         volume = {'name': 'vol-01', 'size': '1'}
-        response = {'code': 1, 'message': 'fail'}
-        self.m.StubOutWithMock(self.driver, '_wait_for_lockstate')
-        self.driver._wait_for_lockstate()
-        self.m_conn.lun.bulk_delete_luns(mox.IsA(str),
-                                         mox.IsA(str)).AndReturn(response)
-        self.driver._wait_for_lockstate()
-        self.m_conn.lun.bulk_delete_luns(mox.IsA(str),
-                                         mox.IsA(str)).AndReturn(response)
-        self.driver._wait_for_lockstate()
-        self.m_conn.lun.bulk_delete_luns(mox.IsA(str),
-                                         mox.IsA(str)).AndReturn(response)
+        response = {'code': 0, 'message': 'LUN deletion started'}
+        self.m.StubOutWithMock(self.driver, '_send_cmd')
+        self.driver._send_cmd(self.m_conn.lun.bulk_delete_luns,
+                              mox.IsA(str),
+                              self.driver.container,
+                              volume['name']
+                              ).AndRaise(violin.ViolinBackendErrNotFound)
         self.m.ReplayAll()
-        self.assertRaises(violin.exception.Error, self.driver._delete_lun,
-                          volume)
+        self.assertTrue(self.driver._delete_lun(volume) is None)
+        self.m.VerifyAll()
+
+    def testDeleteLun_DeleteFailsWithException(self):
+        volume = {'name': 'vol-01', 'size': '1'}
+        response = {'code': 0, 'message': 'LUN deletion started'}
+        self.m.StubOutWithMock(self.driver, '_send_cmd')
+        self.driver._send_cmd(self.m_conn.lun.bulk_delete_luns,
+                              mox.IsA(str),
+                              self.driver.container,
+                              volume['name']
+                              ).AndRaise(violin.ViolinBackendErr('failed!'))
+        self.m.ReplayAll()
+        self.assertRaises(violin.ViolinBackendErr, self.driver._delete_lun, volume)
         self.m.VerifyAll()
 
     def testCreateIscsiTarget(self):
         volume = {'name': 'vol-01', 'size': '1'}
         response = {'code': 0, 'message': 'success'}
         self.m.StubOutWithMock(self.driver, '_get_short_name')
+        self.m.StubOutWithMock(self.driver, '_send_cmd')
         self.driver._get_short_name(mox.IsA(str)).AndReturn(volume['name'])
-        self.m_conn.iscsi.create_iscsi_target(mox.IsA(str)).AndReturn(response)
-        self.m_conn.iscsi.bind_ip_to_target(mox.IsA(str),
-                                            mox.IsA(str)).AndReturn(response)
-        self.m_conn.iscsi.bind_ip_to_target(mox.IsA(str),
-                                            mox.IsA(str)).AndReturn(response)
+        self.driver._send_cmd(self.m_conn.iscsi.create_iscsi_target,
+                              mox.IsA(str), mox.IsA(str)).AndReturn(response)
+        self.driver._send_cmd(self.m_conn.iscsi.bind_ip_to_target,
+                              mox.IsA(str), mox.IsA(str),
+                              mox.IsA(str)).AndReturn(response)
+        self.driver._send_cmd(self.m_conn.iscsi.bind_ip_to_target,
+                              mox.IsA(str), mox.IsA(str),
+                              mox.IsA(str)).AndReturn(response)
         self.m.ReplayAll()
         self.assertTrue(self.driver._create_iscsi_target(volume) in
                         self.driver.array_info)
@@ -316,160 +359,170 @@ class testViolin(unittest.TestCase):
         volume = {'name': 'vol-01', 'size': '1'}
         response = {'code': 0, 'message': 'success'}
         self.m.StubOutWithMock(self.driver, '_get_short_name')
+        self.m.StubOutWithMock(self.driver, '_send_cmd')
         self.driver._get_short_name(mox.IsA(str)).AndReturn(volume['name'])
-        self.m_conn.iscsi.unbind_ip_from_target(mox.IsA(str),
-                                                mox.IsA(str)
-                                                ).AndReturn(response)
-        self.m_conn.iscsi.unbind_ip_from_target(mox.IsA(str),
-                                                mox.IsA(str)
-                                                ).AndReturn(response)
-        self.m_conn.iscsi.delete_iscsi_target(mox.IsA(str)).AndReturn(response)
+        self.driver._send_cmd(self.m_conn.iscsi.unbind_ip_from_target,
+                              mox.IsA(str), mox.IsA(str),
+                              mox.IsA(str)).AndReturn(response)
+        self.driver._send_cmd(self.m_conn.iscsi.unbind_ip_from_target,
+                              mox.IsA(str), mox.IsA(str),
+                              mox.IsA(str)).AndReturn(response)
+        self.driver._send_cmd(self.m_conn.iscsi.delete_iscsi_target,
+                              mox.IsA(str), mox.IsA(str)).AndReturn(response)
         self.m.ReplayAll()
         self.assertTrue(self.driver._delete_iscsi_target(volume) is None)
         self.m.VerifyAll()
 
-    def testDeleteIscsiTarget_UnbindFails(self):
+    def testDeleteIscsiTarget_AnUnbindFailsWithException(self):
         volume = {'name': 'vol-01', 'size': '1'}
-        response = {'code': 1, 'message': 'fail'}
+        response = {'code': 0, 'message': 'success'}
         self.m.StubOutWithMock(self.driver, '_get_short_name')
+        self.m.StubOutWithMock(self.driver, '_send_cmd')
         self.driver._get_short_name(mox.IsA(str)).AndReturn(volume['name'])
-        self.m_conn.iscsi.unbind_ip_from_target(mox.IsA(str),
-                                                mox.IsA(str)
-                                                ).AndReturn(response)
+        self.driver._send_cmd(self.m_conn.iscsi.unbind_ip_from_target,
+                              mox.IsA(str), mox.IsA(str),
+                              mox.IsA(str)).AndReturn(response)
+        self.driver._send_cmd(self.m_conn.iscsi.unbind_ip_from_target,
+                              mox.IsA(str), mox.IsA(str),
+                              mox.IsA(str)
+                              ).AndRaise(violin.ViolinBackendErr('failed!'))
         self.m.ReplayAll()
-        self.assertRaises(violin.exception.Error,
-                          self.driver._delete_iscsi_target,
-                          volume)
+        self.assertRaises(violin.ViolinBackendErr,
+                          self.driver._delete_iscsi_target, volume)
         self.m.VerifyAll()
 
-    def testDeleteIscsiTarget_DeleteFails(self):
+    def testDeleteIscsiTarget_TargetDeleteFailsWithException(self):
         volume = {'name': 'vol-01', 'size': '1'}
-        response1 = {'code': 0, 'message': 'success'}
-        response2 = {'code': 1, 'message': 'fail'}
+        response = {'code': 0, 'message': 'success'}
         self.m.StubOutWithMock(self.driver, '_get_short_name')
+        self.m.StubOutWithMock(self.driver, '_send_cmd')
         self.driver._get_short_name(mox.IsA(str)).AndReturn(volume['name'])
-        self.m_conn.iscsi.unbind_ip_from_target(mox.IsA(str),
-                                                mox.IsA(str)
-                                                ).AndReturn(response1)
-        self.m_conn.iscsi.unbind_ip_from_target(mox.IsA(str),
-                                                mox.IsA(str)
-                                                ).AndReturn(response1)
-        self.m_conn.iscsi.delete_iscsi_target(mox.IsA(str)
-                                              ).AndReturn(response2)
+        self.driver._send_cmd(self.m_conn.iscsi.unbind_ip_from_target,
+                              mox.IsA(str), mox.IsA(str),
+                              mox.IsA(str)).AndReturn(response)
+        self.driver._send_cmd(self.m_conn.iscsi.unbind_ip_from_target,
+                              mox.IsA(str), mox.IsA(str),
+                              mox.IsA(str)).AndReturn(response)
+        self.driver._send_cmd(self.m_conn.iscsi.delete_iscsi_target,
+                              mox.IsA(str), mox.IsA(str)
+                              ).AndRaise(violin.ViolinBackendErr('failed!'))
         self.m.ReplayAll()
-        self.assertRaises(violin.exception.Error,
+        self.assertRaises(violin.ViolinBackendErr,
                           self.driver._delete_iscsi_target, volume)
         self.m.VerifyAll()
 
     def testExportLun(self):
         volume = {'name': 'vol-01', 'size': '1'}
-        response = {'code': 0, 'message': 'success'}
+        igroup = 'test-igroup-1'
+        response = {'code': 0, 'message': ''}
+        connector = {'initiator': 'iqn.1993-08.org.debian:8d3a79542d'}
         self.m.StubOutWithMock(self.driver, '_get_short_name')
+        self.m.StubOutWithMock(self.driver, '_send_cmd')
         self.m.StubOutWithMock(self.driver, '_wait_for_exportstate')
         self.m.StubOutWithMock(self.driver, '_get_lun_id')
         self.driver._get_short_name(mox.IsA(str)).AndReturn(volume['name'])
-        self.m_conn.lun.export_lun(mox.IsA(str), mox.IsA(str),
-                                   mox.IsA(str), mox.IsA(str),
-                                   -1).AndReturn(response)
+        self.driver._send_cmd(self.m_conn.lun.export_lun,
+                              mox.IsA(str), mox.IsA(str), mox.IsA(str),
+                              mox.IsA(str), mox.IsA(str), mox.IsA(str)
+                              ).AndReturn(response)
         self.driver._wait_for_exportstate(mox.IsA(str), mox.IsA(bool))
-        self.driver._get_lun_id(mox.IsA(str), mox.IsA(str),
-                                mox.IsA(str), mox.IsA(str)).AndReturn(1)
+        self.driver._get_lun_id(mox.IsA(str)).AndReturn(1)
         self.m.ReplayAll()
-        self.assertEqual(self.driver._export_lun(volume), 1)
+        self.assertEqual(self.driver._export_lun(volume, connector, igroup), 1)
         self.m.VerifyAll()
 
-    def testExportLun_ExportFails(self):
+    def testExportLun_ExportFailsWithException(self):
         volume = {'name': 'vol-01', 'size': '1'}
-        response = {'code': 1, 'message': 'fail'}
+        igroup = 'test-igroup-1'
+        response = {'code': 0, 'message': ''}
+        connector = {'initiator': 'iqn.1993-08.org.debian:8d3a79542d'}
         self.m.StubOutWithMock(self.driver, '_get_short_name')
+        self.m.StubOutWithMock(self.driver, '_send_cmd')
+        self.m.StubOutWithMock(self.driver, '_wait_for_exportstate')
+        self.m.StubOutWithMock(self.driver, '_get_lun_id')
         self.driver._get_short_name(mox.IsA(str)).AndReturn(volume['name'])
-        self.m_conn.lun.export_lun(mox.IsA(str), mox.IsA(str),
-                                   mox.IsA(str), mox.IsA(str),
-                                   -1).AndReturn(response)
+        self.driver._send_cmd(self.m_conn.lun.export_lun,
+                              mox.IsA(str), mox.IsA(str), mox.IsA(str),
+                              mox.IsA(str), mox.IsA(str), mox.IsA(str)
+                              ).AndRaise(violin.ViolinBackendErr('failed!'))
         self.m.ReplayAll()
-        self.assertRaises(violin.exception.Error, self.driver._export_lun,
-                          volume)
+        self.assertRaises(violin.ViolinBackendErr,
+                          self.driver._export_lun, volume, connector, igroup)
         self.m.VerifyAll()
 
     def testUnexportLun(self):
         volume = {'name': 'vol-01', 'size': '1'}
-        response = {'code': 0, 'message': 'success'}
+        lun_id = 1
+        response = {'code': 0, 'message': ''}
+        self.m.StubOutWithMock(self.driver, '_send_cmd')
         self.m.StubOutWithMock(self.driver, '_wait_for_exportstate')
-        self.m_conn.lun.unexport_lun(mox.IsA(str), mox.IsA(str),
-                                     mox.IsA(str), mox.IsA(str),
-                                     -1).AndReturn(response)
-        self.driver._wait_for_exportstate(mox.IsA(str), mox.IsA(bool))
+        self.driver._send_cmd(self.m_conn.lun.unexport_lun,
+                              mox.IsA(str),
+                              self.driver.container, volume['name'],
+                              'all', 'all', 'auto').AndReturn(response)
+        self.driver._wait_for_exportstate(volume['name'], False)
         self.m.ReplayAll()
         self.assertTrue(self.driver._unexport_lun(volume) is None)
         self.m.VerifyAll()
 
-    def testUnexportLun_UnexportFails(self):
+    def testUnexportLun_UnexportFailsWithException(self):
         volume = {'name': 'vol-01', 'size': '1'}
-        response = {'code': 1, 'message': 'fail'}
-        self.m_conn.lun.unexport_lun(mox.IsA(str), mox.IsA(str),
-                                     mox.IsA(str), mox.IsA(str),
-                                     -1).AndReturn(response)
+        lun_id = 1
+        response = {'code': 0, 'message': ''}
+        self.m.StubOutWithMock(self.driver, '_send_cmd')
+        self.m.StubOutWithMock(self.driver, '_wait_for_exportstate')
+        self.driver._send_cmd(self.m_conn.lun.unexport_lun,
+                              mox.IsA(str),
+                              self.driver.container, volume['name'],
+                              'all', 'all', 'auto'
+                              ).AndRaise(violin.ViolinBackendErr('failed!'))
         self.m.ReplayAll()
-        self.assertRaises(violin.exception.Error,
-                          self.driver._unexport_lun, volume)
+        self.assertRaises(violin.ViolinBackendErr, self.driver._unexport_lun,
+                          volume)
         self.m.VerifyAll()
 
     def testAddIgroupMember(self):
+        igroup = 'test-group-1'
         connector = {'initiator': 'foo'}
         response = {'code': 0, 'message': 'success'}
         self.m_conn.igroup.add_initiators(mox.IsA(str),
                                           mox.IsA(str)).AndReturn(response)
         self.m.ReplayAll()
-        self.assertTrue(self.driver._add_igroup_member(connector) is None)
-        self.m.VerifyAll()
-
-    def testRemoveIgroupMember(self):
-        connector = {'initiator': 'foo'}
-        response = {'code': 0, 'message': 'success'}
-        self.m_conn.basic.get_node_values(mox.IsA(str)).AndReturn({})
-        self.m_conn.igroup.delete_initiators(mox.IsA(str),
-                                             mox.IsA(str)).AndReturn(response)
-        self.m.ReplayAll()
-        self.assertTrue(self.driver._remove_igroup_member(connector) is None)
+        self.assertTrue(self.driver._add_igroup_member(connector, igroup)
+                        is None)
         self.m.VerifyAll()
 
     def testUpdateStats(self):
-        alloc_bytes = 0
-        backend_string = "V6000"
-        vendor_string = "Violin Memory, Inc."
+        backend_name = self.config.volume_backend_name
+        vendor_name = "Violin Memory, Inc."
         tot_bytes = 100 * 1024 * 1024 * 1024
+        alloc_bytes = 50 * 1024 * 1024 * 1024
+        free_bytes = 50 * 1024 * 1024 * 1024
         bn1 = "/vshare/state/global/1/container/myContainer/total_bytes"
         bn2 = "/vshare/state/global/1/container/myContainer/alloc_bytes"
-        bn3 = "/media/state/array/myContainer/chassis/system/type"
-        bn4 = "/hwinfo/state/system_mfr"
-        response = {
-            bn1: tot_bytes,
-            bn2: alloc_bytes,
-            bn3: backend_string,
-            bn4: vendor_string}
-        self.m_conn.basic.get_node_values([bn1, bn2, bn3, bn4]
-                                          ).AndReturn(response)
+        response = {bn1: tot_bytes, bn2: alloc_bytes}
+        self.m_conn.basic.get_node_values([bn1, bn2]).AndReturn(response)
         self.m.ReplayAll()
         self.assertTrue(self.driver._update_stats() is None)
         self.assertEqual(self.driver.stats['total_capacity_gb'], 100)
-        self.assertEqual(self.driver.stats['free_capacity_gb'], 100)
+        self.assertEqual(self.driver.stats['free_capacity_gb'], 50)
         self.assertEqual(self.driver.stats['volume_backend_name'],
-                         backend_string)
-        self.assertEqual(self.driver.stats['vendor_name'], vendor_string)
+                         backend_name)
+        self.assertEqual(self.driver.stats['vendor_name'], vendor_name)
         self.m.VerifyAll()
 
     def testUpdateStats_DataQueryFails(self):
+        backend_name = self.config.volume_backend_name
+        vendor_name = "Violin Memory, Inc."
         bn1 = "/vshare/state/global/1/container/myContainer/total_bytes"
         bn2 = "/vshare/state/global/1/container/myContainer/alloc_bytes"
-        bn3 = "/media/state/array/myContainer/chassis/system/type"
-        bn4 = "/hwinfo/state/system_mfr"
-        self.m_conn.basic.get_node_values([bn1, bn2, bn3, bn4]).AndReturn({})
+        self.m_conn.basic.get_node_values([bn1, bn2]).AndReturn({})
         self.m.ReplayAll()
         self.assertTrue(self.driver._update_stats() is None)
         self.assertEqual(self.driver.stats['total_capacity_gb'], "unknown")
         self.assertEqual(self.driver.stats['free_capacity_gb'], "unknown")
-        self.assertEqual(self.driver.stats['volume_backend_name'], "unknown")
-        self.assertEqual(self.driver.stats['vendor_name'], "Violin")
+        self.assertEqual(self.driver.stats['volume_backend_name'], backend_name)
+        self.assertEqual(self.driver.stats['vendor_name'], vendor_name)
         self.m.VerifyAll()
 
     def testLogin(self):
@@ -494,29 +547,22 @@ class testViolin(unittest.TestCase):
         self.assertFalse(self.driver._login(False))
 
     def testGetLunID(self):
-        container = self.driver.container
-        volume = "vol-01"
-        iqn = "iqn.2004-02.com.vmem:mydnsname-vol-01"
-        igroup = "myigroup"
-        prefix = "/vshare/config/export/container"
-        node = "%s/%s/lun/%s/target/%s/initiator/%s/lun_id" \
-            % (prefix, container, volume, iqn, igroup)
-        response = {node: "1"}
-        self.m_conn.basic.get_node_values(mox.IsA(str)).AndReturn(response)
+        volume = {'name': 'vol-01', 'size': '1'}
+        bn = '/vshare/config/export/container/myContainer/lun/vol-01/target/**'
+        resp = {'/vshare/config/export/container/myContainer/lun'
+                '/vol-01/target/hba-a1/initiator/openstack/lun_id': 1}
+        self.m_conn.basic.get_node_values(bn).AndReturn(resp)
         self.m.ReplayAll()
-        self.assertEqual(self.driver._get_lun_id(container, volume,
-                                                 iqn, igroup), "1")
+        self.assertEqual(self.driver._get_lun_id(volume['name']), 1)
         self.m.VerifyAll()
 
-    def testGetLunID_InvalidLun(self):
-        container = self.driver.container
-        volume = "vol-01"
-        iqn = "iqn.2004-02.com.vmem:mydnsname-vol-01"
-        igroup = "myigroup"
-        self.m_conn.basic.get_node_values(mox.IsA(str)).AndReturn({})
+    def testGetLunID_NoLunConfig(self):
+        volume = {'name': 'vol-01', 'size': '1'}
+        bn = '/vshare/config/export/container/myContainer/lun/vol-01/target/**'
+        resp = {}
+        self.m_conn.basic.get_node_values(bn).AndReturn(resp)
         self.m.ReplayAll()
-        self.assertRaises(KeyError, self.driver._get_lun_id,
-                          container, volume, iqn, igroup)
+        self.assertEqual(self.driver._get_lun_id(volume['name']), -1)
         self.m.VerifyAll()
 
     def testGetShortName_LongName(self):
@@ -533,15 +579,6 @@ class testViolin(unittest.TestCase):
         long_name = ""
         short_name = ""
         self.assertEqual(self.driver._get_short_name(long_name), short_name)
-
-    def testIscsiLocation(self):
-        ip = "1.1.1.1"
-        port = "1234"
-        iqn = "iqn.2004-02.com.vmem:mydnsname-vol-01"
-        lun = "vol-01"
-        expected = "1.1.1.1:1234, iqn.2004-02.com.vmem:mydnsname-vol-01 vol-01"
-        self.assertEqual(self.driver._iscsi_location(ip, port, iqn, lun),
-                         expected)
 
     def testWaitForExportState(self):
         response = {"/vshare/config/export/container/1/lun/vol-01": "vol-01"}

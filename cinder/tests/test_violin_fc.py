@@ -93,19 +93,19 @@ class testViolinFC(unittest.TestCase):
                                        'wwn.21:00:00:24:ff:45:e2:5e',
                                        'wwn.21:00:00:24:ff:45:e2:5f']
         self.volume1 = mox.MockObject(models.Volume)
-        self.volume1.name = 'vol-01'
+        self.volume1.id = '3d31af29-6d7d-443f-b451-6f0040d3c9a9'
         self.volume1.size = 1
         self.volume2 = mox.MockObject(models.Volume)
-        self.volume2.name = 'vol-02'
+        self.volume2.id = '4c1af784-b328-43d2-84c8-db02158b922d'
         self.volume2.size = 2
         self.snapshot1 = mox.MockObject(models.Snapshot)
         self.snapshot1.name = 'snap-01'
-        self.snapshot1.snapshot_id = 1
+        self.snapshot1.snapshot_id = 'f8849c41-6d72-4f5a-8339-2cd6b52b5e5a'
         self.snapshot1.volume_id = 1
         self.snapshot1.volume_name = 'vol-01'
         self.snapshot2 = mox.MockObject(models.Snapshot)
         self.snapshot2.name = 'snap-02'
-        self.snapshot2.snapshot_id = 2
+        self.snapshot2.snapshot_id = '23e44fad-8840-46f1-99d3-5605a08fb289'
         self.snapshot2.volume_id = 2
         self.snapshot2.volume_name = 'vol-02'
 
@@ -130,8 +130,9 @@ class testViolinFC(unittest.TestCase):
         self.m_conn.basic.get_node_values(mox.IsA(str))
         self.m_conn.basic.get_node_values(mox.IsA(str))
         self.m_conn.basic.get_node_values(mox.IsA(str))
-        self.m_conn.basic.get_node_values(mox.IsA(str))
         self.driver._get_active_fc_targets()
+        self.m_conn.basic.get_node_values(mox.IsA(str))
+        self.m_conn.basic.get_node_values(mox.IsA(str))
         self.m.ReplayAll()
         self.assertTrue(self.driver.do_setup(emptyContext) is None)
         self.m.VerifyAll()
@@ -144,12 +145,6 @@ class testViolinFC(unittest.TestCase):
     def testCheckForSetupError_NoContainer(self):
         '''container name is empty '''
         self.driver.container = ""
-        self.assertRaises(violin.InvalidBackendConfig,
-                          self.driver.check_for_setup_error)
-
-    def testCheckForSetupError_NoDeviceId(self):
-        '''device id is empty '''
-        self.driver.device_id = ""
         self.assertRaises(violin.InvalidBackendConfig,
                           self.driver.check_for_setup_error)
 
@@ -287,7 +282,6 @@ class testViolinFC(unittest.TestCase):
     def testTerminateConnection(self):
         volume = self.volume1
         connector = {'wwpns': [u'50014380186b3f65', u'50014380186b3f67']}
-        lun = 1
         self.m.StubOutWithMock(self.driver, '_login')
         self.m.StubOutWithMock(self.driver, '_unexport_lun')
         self.driver._login()
@@ -300,7 +294,6 @@ class testViolinFC(unittest.TestCase):
     def testTerminateConnection_SnapshotObject(self):
         snap = self.snapshot1
         connector = {'wwpns': [u'50014380186b3f65', u'50014380186b3f67']}
-        lun = 1
         self.m.StubOutWithMock(self.driver, '_login')
         self.m.StubOutWithMock(self.driver, '_unexport_snapshot')
         self.driver._login()
@@ -320,40 +313,101 @@ class testViolinFC(unittest.TestCase):
         self.m.VerifyAll()
 
     def testCreateLun(self):
-        volume = {'name': 'vol-01', 'size': '1'}
+        volume = self.volume1
         response = {'code': 0, 'message': 'LUN create: success!'}
         self.m.StubOutWithMock(self.driver, '_send_cmd')
         self.driver._send_cmd(self.m_conn.lun.create_lun,
                               mox.IsA(str),
-                              self.driver.container, volume['name'],
+                              self.driver.container, volume['id'],
                               volume['size'], 1, "0", "0", "w", 1,
-                              512).AndReturn(response)
+                              512, False, False, None).AndReturn(response)
         self.m.ReplayAll()
         self.assertTrue(self.driver._create_lun(volume) is None)
         self.m.VerifyAll()
 
+    def testCreateLun_LunAlreadyExists(self):
+        volume = self.volume1
+        response = {'code': 0, 'message': 'LUN create: success!'}
+        self.m.StubOutWithMock(self.driver, '_send_cmd')
+        self.driver._send_cmd(self.m_conn.lun.create_lun,
+                              mox.IsA(str),
+                              self.driver.container, volume['id'],
+                              volume['size'], 1, "0", "0", "w", 1,
+                              512, False, False, None
+                              ).AndRaise(violin.ViolinBackendErrExists())
+        self.m.ReplayAll()
+        self.assertTrue(self.driver._create_lun(volume) is None)
+        self.m.VerifyAll()
+
+    def testCreateLun_CreateFailsWithException(self):
+        volume = self.volume1
+        response = {'code': 0, 'message': 'LUN create: success!'}
+        self.m.StubOutWithMock(self.driver, '_send_cmd')
+        self.driver._send_cmd(self.m_conn.lun.create_lun,
+                              mox.IsA(str),
+                              self.driver.container, volume['id'],
+                              volume['size'], 1, "0", "0", "w", 1,
+                              512, False, False, None
+                              ).AndRaise(violin.ViolinBackendErr('failed'))
+        self.m.ReplayAll()
+        self.assertRaises(violin.ViolinBackendErr, self.driver._create_lun,
+                          volume)
+        self.m.VerifyAll()
+
     def testDeleteLun(self):
-        volume = {'name': 'vol-01', 'size': '1'}
+        volume = self.volume1
+        response = {'code': 0, 'message': 'LUN deletion started'}
+        self.m.StubOutWithMock(self.driver, '_send_cmd')
+        self.m.StubOutWithMock(self.driver.lun_tracker,
+                               'free_lun_id_for_volume')
+        self.driver._send_cmd(self.m_conn.lun.bulk_delete_luns,
+                              mox.IsA(str),
+                              self.driver.container,
+                              volume['id']).AndReturn(response)
+        self.driver.lun_tracker.free_lun_id_for_volume(volume)
+        self.m.ReplayAll()
+        self.assertTrue(self.driver._delete_lun(volume) is None)
+        self.m.VerifyAll()
+
+    def testDeleteLun_LunAlreadyDeleted(self):
+        volume = self.volume1
+        response = {'code': 0, 'message': 'LUN deletion started'}
+        self.m.StubOutWithMock(self.driver, '_send_cmd')
+        self.m.StubOutWithMock(self.driver.lun_tracker,
+                               'free_lun_id_for_volume')
+        self.driver._send_cmd(self.m_conn.lun.bulk_delete_luns,
+                              mox.IsA(str),
+                              self.driver.container,
+                              volume['id']
+                              ).AndRaise(violin.ViolinBackendErrNotFound)
+        self.driver.lun_tracker.free_lun_id_for_volume(volume)
+        self.m.ReplayAll()
+        self.assertTrue(self.driver._delete_lun(volume) is None)
+        self.m.VerifyAll()
+
+    def testDeleteLun_DeleteFailsWithException(self):
+        volume = self.volume1
         response = {'code': 0, 'message': 'LUN deletion started'}
         self.m.StubOutWithMock(self.driver, '_send_cmd')
         self.driver._send_cmd(self.m_conn.lun.bulk_delete_luns,
                               mox.IsA(str),
                               self.driver.container,
-                              volume['name']).AndReturn(response)
+                              volume['id']
+                              ).AndRaise(violin.ViolinBackendErr('failed!'))
         self.m.ReplayAll()
-        self.assertTrue(self.driver._delete_lun(volume) is None)
+        self.assertRaises(violin.ViolinBackendErr,
+                          self.driver._delete_lun, volume)
         self.m.VerifyAll()
 
     def testCreateLunSnapshot(self):
-        snapshot = {'snapshot_id': 1, 'volume_id': 1,
-                    'volume_name': 'vol-01', 'name': 'snap-01'}
+        snapshot = self.snapshot1
         response = {'code': 0, 'message': 'success'}
         self.m.StubOutWithMock(self.driver, '_send_cmd')
         self.driver._send_cmd(self.m_conn.snapshot.create_lun_snapshot,
                               mox.IsA(str),
                               self.driver.container,
-                              snapshot['volume_name'],
-                              snapshot['name']).AndReturn(response)
+                              snapshot['volume_id'],
+                              snapshot['id']).AndReturn(response)
         self.m.ReplayAll()
         self.assertTrue(self.driver._create_lun_snapshot(snapshot) is None)
         self.m.VerifyAll()
@@ -362,50 +416,89 @@ class testViolinFC(unittest.TestCase):
         snapshot = self.snapshot1
         response = {'code': 0, 'message': 'success'}
         self.m.StubOutWithMock(self.driver, '_send_cmd')
+        self.m.StubOutWithMock(self.driver.lun_tracker,
+                               'free_lun_id_for_snapshot')
         self.driver._send_cmd(self.m_conn.snapshot.delete_lun_snapshot,
                               mox.IsA(str),
                               self.driver.container,
-                              snapshot['volume_name'],
-                              snapshot['name']).AndReturn(response)
+                              snapshot['volume_id'],
+                              snapshot['id']).AndReturn(response)
+        self.driver.lun_tracker.free_lun_id_for_snapshot(snapshot)
         self.m.ReplayAll()
         self.assertTrue(self.driver._delete_lun_snapshot(snapshot) is None)
         self.m.VerifyAll()
 
     def testExportLun(self):
         volume = self.volume1
-        lun_id = 1
+        lun_id = '1'
         igroup = 'test-igroup-1'
         connector = {'wwpns': [u'50014380186b3f65', u'50014380186b3f67']}
         response = {'code': 0, 'message': ''}
-        self.m.StubOutWithMock(self.driver, '_send_cmd')
-        self.m.StubOutWithMock(self.driver, '_wait_for_exportstate')
-        self.m.StubOutWithMock(self.driver, '_get_lun_id')
-        self.driver._send_cmd(self.m_conn.lun.export_lun,
-                              mox.IsA(str),
-                              self.driver.container, volume['name'],
-                              'all', igroup, 'auto').AndReturn(response)
-        self.driver._wait_for_exportstate(volume['name'], True)
-        self.driver._get_lun_id(volume['name']).AndReturn(lun_id)
+        self.m.StubOutWithMock(self.driver.lun_tracker,
+                               'get_lun_id_for_volume')
+        self.m.StubOutWithMock(self.driver, '_send_cmd_and_verify')
+        self.driver.lun_tracker.get_lun_id_for_volume(volume).AndReturn(lun_id)
+        self.driver._send_cmd_and_verify(self.m_conn.lun.export_lun,
+                                         self.driver._wait_for_exportstate,
+                                         mox.IsA(str),
+                                         [self.driver.container, volume['id'],
+                                          'all', igroup, lun_id],
+                                         [volume['id'], True]
+                                         ).AndReturn(response)
         self.m.ReplayAll()
-        self.assertEqual(self.driver._export_lun(volume, connector, igroup), lun_id)
+        self.assertEqual(self.driver._export_lun(volume, connector, igroup),
+                         lun_id)
         self.m.VerifyAll()
 
-    # TODO(rdl) missing tests
-    #def testExportLun_WithException
+    def testExportLun_ExportFailsWithException(self):
+        volume = self.volume1
+        lun_id = '1'
+        igroup = 'test-igroup-1'
+        connector = {'wwpns': [u'50014380186b3f65', u'50014380186b3f67']}
+        response = {'code': 0, 'message': ''}
+        self.m.StubOutWithMock(self.driver.lun_tracker,
+                               'get_lun_id_for_volume')
+        self.m.StubOutWithMock(self.driver, '_send_cmd_and_verify')
+        self.driver.lun_tracker.get_lun_id_for_volume(volume).AndReturn(lun_id)
+        self.driver._send_cmd_and_verify(self.m_conn.lun.export_lun,
+                                         self.driver._wait_for_exportstate,
+                                         mox.IsA(str),
+                                         [self.driver.container, volume['id'],
+                                          'all', igroup, lun_id],
+                                         [volume['id'], True]
+                                         ).AndRaise(violin.ViolinBackendErr('failed!'))
+        self.m.ReplayAll()
+        self.assertRaises(violin.ViolinBackendErr,
+                          self.driver._export_lun, volume, connector, igroup)
+        self.m.VerifyAll()
 
     def testUnexportLun(self):
         volume = self.volume1
-        lun_id = 1
         response = {'code': 0, 'message': ''}
-        self.m.StubOutWithMock(self.driver, '_send_cmd')
-        self.m.StubOutWithMock(self.driver, '_wait_for_exportstate')
-        self.driver._send_cmd(self.m_conn.lun.unexport_lun,
-                              mox.IsA(str),
-                              self.driver.container, volume['name'],
-                              'all', 'all', 'auto').AndReturn(response)
-        self.driver._wait_for_exportstate(volume['name'], False)
+        self.m.StubOutWithMock(self.driver, '_send_cmd_and_verify')
+        self.driver._send_cmd_and_verify(self.m_conn.lun.unexport_lun,
+                                         self.driver._wait_for_exportstate,
+                                         mox.IsA(str),
+                                         [self.driver.container, volume['id'],
+                                          'all', 'all', 'auto'],
+                                         [volume['id'], False]).AndReturn(response)
         self.m.ReplayAll()
         self.assertTrue(self.driver._unexport_lun(volume) is None)
+        self.m.VerifyAll()
+
+    def testUnexportLun_UnexportFailsWithException(self):
+        volume = self.volume1
+        response = {'code': 0, 'message': ''}
+        self.m.StubOutWithMock(self.driver, '_send_cmd_and_verify')
+        self.driver._send_cmd_and_verify(self.m_conn.lun.unexport_lun,
+                                         self.driver._wait_for_exportstate,
+                                         mox.IsA(str),
+                                         [self.driver.container, volume['id'],
+                                          'all', 'all', 'auto'],
+                                         [volume['id'], False]).AndRaise(violin.ViolinBackendErr('failed!'))
+        self.m.ReplayAll()
+        self.assertRaises(violin.ViolinBackendErr, self.driver._unexport_lun,
+                          volume)
         self.m.VerifyAll()
 
     # TODO(rdl) missing tests
@@ -485,11 +578,8 @@ class testViolinFC(unittest.TestCase):
     def testSendCmd(self):
         request_func = self.m.CreateMockAnything()
         success_msg = 'success'
-        exception_msg = 'failed'
         request_args = ['arg1', 'arg2', 'arg3']
         response = {'code': 0, 'message': 'success'}
-        self.m.StubOutWithMock(time, 'sleep')
-        time.sleep(mox.IsA(int))
         request_func(request_args).AndReturn(response)
         self.m.ReplayAll()
         self.assertEqual(self.driver._send_cmd
@@ -501,7 +591,6 @@ class testViolinFC(unittest.TestCase):
         '''the retry timeout is hit '''
         request_func = self.m.CreateMockAnything()
         success_msg = 'success'
-        exception_msg = 'failed'
         request_args = ['arg1', 'arg2', 'arg3']
         self.driver.request_timeout = 0
         self.m.ReplayAll()
@@ -514,14 +603,10 @@ class testViolinFC(unittest.TestCase):
         '''the callback response dict has a NULL message field '''
         request_func = self.m.CreateMockAnything()
         success_msg = 'success'
-        exception_msg = 'failed'
         request_args = ['arg1', 'arg2', 'arg3']
         response1 = {'code': 0, 'message': None}
         response2 = {'code': 0, 'message': 'success'}
-        self.m.StubOutWithMock(time, 'sleep')
-        time.sleep(mox.IsA(int))
         request_func(request_args).AndReturn(response1)
-        time.sleep(mox.IsA(int))
         request_func(request_args).AndReturn(response2)
         self.m.ReplayAll()
         self.assertEqual(self.driver._send_cmd
@@ -533,11 +618,8 @@ class testViolinFC(unittest.TestCase):
         '''the callback response dict contains a fatal error code '''
         request_func = self.m.CreateMockAnything()
         success_msg = 'success'
-        exception_msg = 'failed'
         request_args = ['arg1', 'arg2', 'arg3']
         response = {'code': 14000, 'message': 'try again later.'}
-        self.m.StubOutWithMock(time, 'sleep')
-        time.sleep(mox.IsA(int))
         request_func(request_args).AndReturn(response)
         self.m.ReplayAll()
         self.assertRaises(violin.ViolinBackendErr,
@@ -545,20 +627,11 @@ class testViolinFC(unittest.TestCase):
                           request_func, success_msg, request_args)
         self.m.VerifyAll()
 
-    def testGetLunID(self):
-        volume = {'name': 'vol-01', 'size': '1'}
-        bn = '/vshare/config/export/container/myContainer/lun/vol-01/target/**'
-        resp = {'/vshare/config/export/container/myContainer/lun'
-                '/vol-01/target/hba-a1/initiator/openstack/lun_id': 1}
-        self.m_conn.basic.get_node_values(bn).AndReturn(resp)
-        self.m.ReplayAll()
-        self.assertEqual(self.driver._get_lun_id(volume['name']), 1)
-        self.m.VerifyAll()
-
     def testWaitForExportState(self):
         bn = '/vshare/config/export/container/myContainer/lun/vol-01'
         resp = {'/vshare/config/export/container/myContainer/lun/vol-01':
                 'vol-01'}
+        self.m_conn.basic.get_node_values(bn).AndReturn(resp)
         self.m_conn.basic.get_node_values(bn).AndReturn(resp)
         self.m.ReplayAll()
         self.assertEqual(self.driver._wait_for_exportstate('vol-01', True),

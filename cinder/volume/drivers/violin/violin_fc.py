@@ -53,6 +53,7 @@ from cinder.db.sqlalchemy import models
 from cinder import exception
 from cinder.openstack.common import log as logging
 from cinder.openstack.common import timeutils
+from cinder import utils
 from cinder.volume.driver import FibreChannelDriver
 from cinder.volume import volume_types
 
@@ -142,11 +143,11 @@ class ViolinFCDriver(FibreChannelDriver):
         self.vmem_mga = None
         self.vmem_mgb = None
         self.container = ""
-        self.device_id = ""
         self.stats = {}
         self.gateway_fc_wwns = []
         self.config = kwargs.get('configuration', None)
         self.context = None
+        self.lun_tracker = LunIdList(self.db)
         if self.config:
             self.config.append_config_values(violin_opts)
 
@@ -184,24 +185,33 @@ class ViolinFCDriver(FibreChannelDriver):
         ret_dict = vip.get_node_values("/vshare/state/local/container/*")
         if ret_dict:
             self.container = ret_dict.items()[0][1]
-        ret_dict = vip.get_node_values(
-            "/media/state/array/%s/chassis/system/dev_id" % self.container)
-        if ret_dict:
-            self.device_id = ret_dict.items()[0][1]
         ret_dict = vip.get_node_values("/wsm/inactivity_timeout")
         if ret_dict:
-            self.timeout = ret_dict.items()[0][1]
+            self.session_timeout = ret_dict.items()[0][1]
 
         self.gateway_fc_wwns = self._get_active_fc_targets()
+
+        ret_dict = vip.get_node_values(
+            "/vshare/state/local/container/%s/lun/*"
+            % self.container)
+        if ret_dict:
+            self.lun_tracker.update_from_volume_ids(ret_dict.values())
+
+        ret_dict = vip.get_node_values(
+            "/vshare/state/snapshot/container/%s/lun/*"
+            % self.container)
+        if ret_dict:
+            for vol_id in ret_dict.values():
+                snaps = vip.get_node_values(
+                    "/vshare/state/snapshot/container/%s/lun/%s/snap/*"
+                    % (self.container, vol_id))
+                self.lun_tracker.update_from_snapshot_ids(snaps.values())
 
     def check_for_setup_error(self):
         """Returns an error if prerequisites aren't met"""
         vip = self.vmem_vip.basic
-
         if len(self.container) == 0:
             raise InvalidBackendConfig(reason=_('container is missing'))
-        if len(self.device_id) == 0:
-            raise InvalidBackendConfig(reason=_('device ID is missing'))
         if len(self.gateway_fc_wwns) == 0:
             raise InvalidBackendConfig(reason=_('No FCP targets found'))
 
@@ -306,6 +316,7 @@ class ViolinFCDriver(FibreChannelDriver):
             self._update_stats()
         return self.stats
 
+    @utils.synchronized('vmem-lun')
     def _create_lun(self, volume):
         """
         Creates a new lun.
@@ -324,22 +335,24 @@ class ViolinFCDriver(FibreChannelDriver):
         if self.config.use_thin_luns:
             lun_type = '1'
 
-        # using the defaults for other fields: (quantity, nozero,
-        # readonly, startnum, blksize)
+        # using the defaults for fields: quantity, nozero,
+        # readonly, startnum, blksize, naca, alua, preferredport
         #
         try:
             self._send_cmd(v.lun.create_lun,
                            'LUN create: success!',
-                           self.container, volume['name'],
-                           volume['size'], 1, '0', lun_type, 'w', 1, 512)
+                           self.container, volume['id'],
+                           volume['size'], 1, '0', lun_type, 'w',
+                           1, 512, False, False, None)
 
         except ViolinBackendErrExists:
-            LOG.info(_("Lun %s already exists, continuing"), volume['name'])
+            LOG.info(_("Lun %s already exists, continuing"), volume['id'])
 
         except Exception:
-            LOG.info(_("Lun create failed!"))
+            LOG.warn(_("Lun create failed!"))
             raise
 
+    @utils.synchronized('vmem-lun')
     def _delete_lun(self, volume):
         """
         Deletes a lun.
@@ -352,25 +365,28 @@ class ViolinFCDriver(FibreChannelDriver):
         """
         v = self.vmem_vip
 
-        LOG.info(_("Deleting lun %s"), volume['name'])
+        LOG.info(_("Deleting lun %s"), volume['id'])
 
         try:
             self._send_cmd(v.lun.bulk_delete_luns,
                            'LUN deletion started',
-                           self.container, volume['name'])
+                           self.container, volume['id'])
 
         except ViolinBackendErrNotFound:
-            LOG.info(_("Lun %s already deleted, continuing"), volume['name'])
+            LOG.info(_("Lun %s already deleted, continuing"), volume['id'])
 
         except ViolinBackendErrExists:
-            LOG.info(_("Lun %s has dependent snapshots, skipping"),
-                     volume['name'])
-            raise exception.VolumeIsBusy(volume_name=volume['name'])
+            LOG.warn(_("Lun %s has dependent snapshots, skipping"),
+                     volume['id'])
+            raise exception.VolumeIsBusy(volume_name=volume['id'])
 
         except Exception:
             LOG.exception(_("Lun delete failed!"))
             raise
 
+        self.lun_tracker.free_lun_id_for_volume(volume)
+
+    @utils.synchronized('vmem-snap')
     def _create_lun_snapshot(self, snapshot):
         """
         Creates a new snapshot for a lun
@@ -383,22 +399,23 @@ class ViolinFCDriver(FibreChannelDriver):
         """
         v = self.vmem_vip
 
-        LOG.info(_("Creating snapshot %s"), snapshot['name'])
+        LOG.info(_("Creating snapshot %s"), snapshot['id'])
 
         try:
             self._send_cmd(v.snapshot.create_lun_snapshot,
                            'Snapshot create: success!',
-                           self.container, snapshot['volume_name'],
-                           snapshot['name'])
+                           self.container, snapshot['volume_id'],
+                           snapshot['id'])
 
         except ViolinBackendErrExists:
             LOG.info(_("Snapshot %s already exists, continuing"),
-                     snapshot['name'])
+                     snapshot['id'])
 
         except Exception:
             LOG.exception(_("LUN snapshot create failed!"))
             raise
 
+    @utils.synchronized('vmem-snap')
     def _delete_lun_snapshot(self, snapshot):
         """
         Deletes an existing snapshot for a lun
@@ -411,22 +428,25 @@ class ViolinFCDriver(FibreChannelDriver):
         """
         v = self.vmem_vip
 
-        LOG.info(_("Deleting snapshot %s"), snapshot['name'])
+        LOG.info(_("Deleting snapshot %s"), snapshot['id'])
 
         try:
             self._send_cmd(v.snapshot.delete_lun_snapshot,
                            'Snapshot delete: success!',
-                           self.container, snapshot['volume_name'],
-                           snapshot['name'])
+                           self.container, snapshot['volume_id'],
+                           snapshot['id'])
 
         except ViolinBackendErrNotFound:
             LOG.info(_("Snapshot %s already deleted, continuing"),
-                     snapshot['name'])
+                     snapshot['id'])
 
         except Exception:
             LOG.exception(_("LUN snapshot delete failed!"))
             raise
 
+        self.lun_tracker.free_lun_id_for_snapshot(snapshot)
+
+    @utils.synchronized('vmem-export')
     def _export_lun(self, volume, connector=None, igroup=None):
         """
         Generates the export configuration for the given volume
@@ -442,9 +462,11 @@ class ViolinFCDriver(FibreChannelDriver):
         Returns:
             lun_id -- the LUN ID assigned by the backend
         """
-        lun_id = -1
+        lun_id = ''
         export_to = ''
         v = self.vmem_vip
+
+        lun_id = self.lun_tracker.get_lun_id_for_volume(volume)
 
         if igroup:
             export_to = igroup
@@ -454,23 +476,24 @@ class ViolinFCDriver(FibreChannelDriver):
         else:
             raise exception.Error(_("No initiators found, cannot proceed"))
 
-        LOG.info(_("Exporting lun %s"), volume['name'])
+        LOG.info(_("Exporting lun %(vol_id)s on lun_id %(lun_id)s") %
+                 {'vol_id': volume['id'], 'lun_id': lun_id})
 
         try:
-            self._send_cmd(v.lun.export_lun, '',
-                           self.container, volume['name'], 'all',
-                           export_to, 'auto')
+            self._send_cmd_and_verify(v.lun.export_lun,
+                                      self._wait_for_exportstate,
+                                      '',
+                                      [self.container, volume['id'],
+                                       'all', export_to, lun_id],
+                                      [volume['id'], True])
 
         except Exception:
             LOG.exception(_("LUN export failed!"))
             raise
 
-        else:
-            self._wait_for_exportstate(volume['name'], True)
-            lun_id = self._get_lun_id(volume['name'])
-
         return lun_id
 
+    @utils.synchronized('vmem-export')
     def _unexport_lun(self, volume):
         """
         Removes the export configuration for the given volume.
@@ -483,24 +506,25 @@ class ViolinFCDriver(FibreChannelDriver):
         """
         v = self.vmem_vip
 
-        LOG.info(_("Unexporting lun %s"), volume['name'])
+        LOG.info(_("Unexporting lun %s"), volume['id'])
 
         try:
-            self._send_cmd(v.lun.unexport_lun, '',
-                           self.container, volume['name'],
-                           'all', 'all', 'auto')
+            self._send_cmd_and_verify(v.lun.unexport_lun,
+                                      self._wait_for_exportstate,
+                                      '',
+                                      [self.container, volume['id'],
+                                       'all', 'all', 'auto'],
+                                      [volume['id'], False])
 
         except ViolinBackendErrNotFound:
             LOG.info(_("Lun %s already unexported, continuing"),
-                     volume['name'])
+                     volume['id'])
 
         except Exception:
             LOG.exception(_("LUN unexport failed!"))
             raise
 
-        else:
-            self._wait_for_exportstate(volume['name'], False)
-
+    @utils.synchronized('vmem-export')
     def _export_snapshot(self, snapshot, connector=None, igroup=None):
         """
         Generates the export configuration for the given snapshot.
@@ -516,9 +540,11 @@ class ViolinFCDriver(FibreChannelDriver):
         Returns:
             lun_id -- the LUN ID assigned by the backend
         """
-        lun_id = -1
+        lun_id = ''
         export_to = ''
         v = self.vmem_vip
+
+        lun_id = self.lun_tracker.get_lun_id_for_snapshot(snapshot)
 
         if igroup:
             export_to = igroup
@@ -528,28 +554,23 @@ class ViolinFCDriver(FibreChannelDriver):
         else:
             raise exception.Error(_("No initiators found, cannot proceed"))
 
-        LOG.info(_("Exporting snapshot %s"), snapshot['name'])
+        LOG.info(_("Exporting snapshot %s"), snapshot['id'])
 
         try:
             self._send_cmd(v.snapshot.export_lun_snapshot, '',
-                           self.container, snapshot['volume_name'],
-                           snapshot['name'], export_to, 'all', 'auto')
-
-        except ViolinBackendErrNotFound:
-            LOG.info(_("Snap %s already unexported, continuing"),
-                     volume['name'])
+                           self.container, snapshot['volume_id'],
+                           snapshot['id'], export_to, 'all', lun_id)
 
         except Exception:
             LOG.exception(_("Snapshot export failed!"))
             raise
 
         else:
-            self._wait_for_exportstate(snapshot['name'], True)
-            lun_id = self._get_snapshot_id(snapshot['volume_name'],
-                                           snapshot['name'])
+            self._wait_for_exportstate(snapshot['id'], True)
 
         return lun_id
 
+    @utils.synchronized('vmem-export')
     def _unexport_snapshot(self, snapshot):
         """
         Removes the export configuration for the given snapshot.
@@ -559,25 +580,22 @@ class ViolinFCDriver(FibreChannelDriver):
 
         Arguments:
             snapshot -- snapshot object provided by the Manager
-
-        Returns:
-            lun_id -- the LUN ID assigned by the backend
         """
         v = self.vmem_vip
 
-        LOG.info(_("Unexporting snapshot %s"), snapshot['name'])
+        LOG.info(_("Unexporting snapshot %s"), snapshot['id'])
 
         try:
             self._send_cmd(v.snapshot.unexport_lun_snapshot, '',
-                           self.container, snapshot['volume_name'],
-                           snapshot['name'], 'all', 'all', 'auto', False)
+                           self.container, snapshot['volume_id'],
+                           snapshot['id'], 'all', 'all', 'auto', False)
 
         except Exception:
             LOG.exception(_("Snapshot export failed!"))
             raise
 
         else:
-            self._wait_for_exportstate(snapshot['name'], False)
+            self._wait_for_exportstate(snapshot['id'], False)
 
     def _add_igroup_member(self, connector, igroup):
         """
@@ -642,232 +660,6 @@ class ViolinFCDriver(FibreChannelDriver):
 
         self.stats = data
 
-    def _login(self, force=False):
-        """
-        Get new api creds from the backend, only if needed.
-
-        Arguments:
-            force -- re-login on all sessions regardless of last login time
-
-        Returns:
-           True if sessions were refreshed, false otherwise.
-        """
-        now = time.time()
-        if abs(now - self.session_start_time) >= self.session_timeout or \
-                force == True:
-            self.vmem_vip.basic.login()
-            self.vmem_mga.basic.login()
-            self.vmem_mgb.basic.login()
-            self.session_start_time = now
-            return True
-        return False
-
-    def _send_cmd(self, request_func, success_msg, *args):
-        """
-        Run an XG request function, and retry every 0-5 seconds until the
-        request returns a success message, a failure message, or the global
-        request timeout is hit.
-
-        This wrapper is meant to deal with backend requests that can
-        fail for any variety of reasons, for instance, when the system
-        is already busy handling other LUN requests.  It is also smart
-        enough to give up if clustering is down (eg no HA available),
-        there is no space left, or other "fatal" errors are returned
-        (see _fatal_error_code() for a list of all known error
-        conditions).
-
-        Arguments:
-            request_func    -- XG api method to call
-            success_msg     -- Success message expected from the backend
-            *args           -- argument array to be passed to the request_func
-
-        Returns:
-            The response dict from the last XG call.
-        """
-        resp = {}
-        start = time.time()
-
-        while True:
-            if time.time() - start >= self.request_timeout:
-                raise RequestRetryTimeout(timeout=self.request_timeout)
-
-            time.sleep(random.randint(0, 5))
-            resp = request_func(*args)
-
-            if not resp['message']:
-                # XG requests will return None for a message if no message
-                # string is passed int the raw response
-                resp['message'] = ''
-
-            if not resp['code'] and success_msg in resp['message']:
-                break
-
-            self._fatal_error_code(resp)
-
-        return resp
-
-    def _get_lun_id(self, volume_name):
-        """
-        Queries the gateway to find the lun id for the exported
-        volume.  Technically a lun id is assigned for each target, but
-        it is the same value for all targets.
-
-        Arguments:
-            volume_name    -- LUN to query
-
-        Returns:
-            LUN ID for the exported lun as an integer.  If no LUN ID
-            is found, return -1.
-        """
-        vip = self.vmem_vip.basic
-        lun_id = -1
-
-        prefix = "/vshare/config/export/container"
-        bn = "%s/%s/lun/%s/target/**" \
-            % (prefix, self.container, volume_name)
-        resp = vip.get_node_values(bn)
-
-        # EX: /vshare/config/export/container/PROD08/lun/test1/target/hba-b2/
-        #     initiator/openstack/lun_id = 1 (int16)
-        #
-        for node in resp:
-            if node.endswith('/lun_id'):
-                lun_id = resp[node]
-                break
-
-        # TODO(rdl): add exception for case where no lun id found, or lun ids
-        # do not match
-        #
-        return lun_id
-
-    def _get_snapshot_id(self, volume_name, snapshot_name):
-        """
-        Queries the gateway to find the lun id for the exported
-        volume.  Technically a lun id is assigned for each target, but
-        it is the same value for all targets.
-
-        Arguments:
-            volume_name    -- LUN to query
-            snapshot_name  -- Exported snapshot associated with LUN
-
-        Returns:
-            LUN ID for the exported lun as an integer.  If no LUN ID
-            is found, return -1.
-        """
-        vip = self.vmem_vip.basic
-        lun_id = -1
-
-        prefix = "/vshare/config/export/snapshot/container"
-        bn = "%s/%s/lun/%s/snap/%s/target/**" \
-            % (prefix, self.container, volume_name, snapshot_name)
-        resp = vip.get_node_values(bn)
-
-        # EX: /vshare/config/export/snapshot/container/PROD08/lun/
-        # test1/snap/snap1/target/hba-a1/initiator/all/lun_id = 1
-        #
-        for node in resp:
-            if node.endswith('/lun_id'):
-                lun_id = resp[node]
-                break
-
-        # TODO(rdl): add exception for case where no lun id found, or lun ids
-        # do not match
-        #
-        return lun_id
-
-    def _wait_for_exportstate(self, volume_name, state=False):
-        """
-        Polls volume's export configuration root.
-
-        XG sets/queries following a request to create or delete a
-        lun export may fail on the backend if vshared is still
-        processing the export action.  We can check whether it is
-        done by polling the export binding for a lun to
-        ensure it is created or deleted.
-
-        Arguments:
-            volume_name -- name of volume to be polled
-            state       -- True to poll for existence, False for lack of
-
-        Returns:
-            True if the export state was eventually found, false otherwise.
-        """
-        status = False
-        vip = self.vmem_vip.basic
-
-        # TODO(rdl): this implementation only waits on the master, but
-        # may need to additionally wait for the standby to finish the
-        # config sync
-        #
-
-        bn = "/vshare/config/export/container/%s/lun/%s" \
-            % (self.container, volume_name)
-
-        for i in xrange(30):
-            resp = vip.get_node_values(bn)
-            if state and len(resp.keys()):
-                status = True
-                break
-            elif (not state) and (not len(resp.keys())):
-                break
-            else:
-                time.sleep(1)
-        return status
-
-    def _get_active_fc_targets(self):
-        """
-        Get a list of gateway WWNs that can be used as FCP targets.
-
-        Arguments:
-            mg_conn -- active XG connection to one of the gateways
-
-        Returns:
-            active_gw_fcp_wwns -- list of WWNs
-        """
-        v = self.vmem_vip.basic
-        active_gw_fcp_wwns = []
-
-        for i in self.gateway_ids:
-            bn = "/vshare/state/global/%d/target/fc/**" % self.gateway_ids[i]
-            resp = v.get_node_values(bn)
-
-            for node in resp:
-                if node.endswith('/wwn'):
-                    active_gw_fcp_wwns.append(resp[node])
-
-        return self._convert_wwns_vmem_to_openstack(active_gw_fcp_wwns)
-
-    def _get_igroup(self, volume, connector):
-        """
-        Gets the igroup that should be used when configuring a volume
-
-        Arguments:
-            volume: volume object used to determine the igroup name
-
-        Returns:
-            igroup_name: name of igroup (for configuring targets & initiators)
-        """
-        v = self.vmem_vip
-
-        # Use the connector's primary hostname and use that as the
-        # name of the igroup.  The name must follow syntax rules
-        # required by the array: "must contain only alphanumeric
-        # characters, dashes, and underscores.  The first character
-        # must be alphanumeric".
-        #
-        igroup_name = re.sub(r'[\W]', '_',connector['host'])
-
-        # verify that the igroup has been created on the backend, and
-        # if it doesn't exist, create it!
-        #
-        bn = "/vshare/config/igroup/%s" % igroup_name
-        resp = v.basic.get_node_values(bn)
-
-        if not len(resp):
-            v.igroup.create_igroup(igroup_name)
-
-        return igroup_name
-
     def _convert_wwns_openstack_to_vmem(self, wwns):
         """
         Convert a list of Openstack WWNs to VMEM compatible WWN
@@ -907,11 +699,204 @@ class ViolinFCDriver(FibreChannelDriver):
             output.append(''.join(w[4:].split(':')))
         return output
 
+###############################################################################
+###############################################################################
+###############################################################################
+
+    def _login(self, force=False):
+        """
+        Get new api creds from the backend, only if needed.
+
+        Arguments:
+            force -- re-login on all sessions regardless of last login time
+
+        Returns:
+           True if sessions were refreshed, false otherwise.
+        """
+        now = time.time()
+        if abs(now - self.session_start_time) >= self.session_timeout or \
+                force == True:
+            self.vmem_vip.basic.login()
+            self.vmem_mga.basic.login()
+            self.vmem_mgb.basic.login()
+            self.session_start_time = now
+            return True
+        return False
+
+    def _send_cmd(self, request_func, success_msg, *args):
+        """
+        Run an XG request function, and retry until the request
+        returns a success message, a failure message, or the global
+        request timeout is hit.
+
+        This wrapper is meant to deal with backend requests that can
+        fail for any variety of reasons, for instance, when the system
+        is already busy handling other LUN requests.  It is also smart
+        enough to give up if clustering is down (eg no HA available),
+        there is no space left, or other "fatal" errors are returned
+        (see _fatal_error_code() for a list of all known error
+        conditions).
+
+        Arguments:
+            request_func    -- XG api method to call
+            success_msg     -- Success message expected from the backend
+            *args           -- argument array to be passed to the request_func
+
+        Returns:
+            The response dict from the last XG call.
+        """
+        resp = {}
+        start = time.time()
+
+        while True:
+            if time.time() - start >= self.request_timeout:
+                raise RequestRetryTimeout(timeout=self.request_timeout)
+
+            resp = request_func(*args)
+
+            if not resp['message']:
+                # XG requests will return None for a message if no message
+                # string is passed int the raw response
+                resp['message'] = ''
+
+            if not resp['code'] and success_msg in resp['message']:
+                break
+
+            self._fatal_error_code(resp)
+
+        return resp
+
+    def _send_cmd_and_verify(self, request_func, verify_func,
+                             request_success_msg='', rargs=[], vargs=[]):
+        """
+        Run an XG request function, and verify success using an
+        additional verify function.  If the verification fails, then
+        retry the request/verify cycle until both functions are
+        successful, the request function returns a failure message, or
+        the global request timeout is hit.
+
+        This wrapper is meant to deal with backend requests that can
+        fail for any variety of reasons, for instance, when the system
+        is already busy handling other LUN requests.  It is also smart
+        enough to give up if clustering is down (eg no HA available),
+        there is no space left, or other "fatal" errors are returned
+        (see _fatal_error_code() for a list of all known error
+        conditions).
+
+        Arguments:
+            request_func        -- XG api method to call
+            verify_func         -- function to call to verify request was
+                                   completed successfully (eg for export)
+            request_success_msg -- Success message expected from the backend
+                                   for the request_func
+            *rargs              -- argument array to be passed to the
+                                   request_func
+            *vargs              -- argument array to be passed to the
+                                   verify_func
+
+        Returns:
+            The response dict from the last XG call.
+        """
+        resp = {}
+        start = time.time()
+        request_needed = True
+        verify_needed = True
+
+        while request_needed or verify_needed:
+            if time.time() - start >= self.request_timeout:
+                raise RequestRetryTimeout(timeout=self.request_timeout)
+
+            if request_needed:
+                resp = request_func(*rargs)
+                if not resp['message']:
+                    # XG requests will return None for a message if no message
+                    # string is passed int the raw response
+                    resp['message'] = ''
+                if not resp['code'] and request_success_msg in resp['message']:
+                    # XG request func was completed
+                    request_needed = False
+                self._fatal_error_code(resp)
+
+            elif verify_needed:
+                success = verify_func(*vargs)
+                if success:
+                    # XG verify func was completed
+                    verify_needed = False
+                else:
+                    # try sending the request again
+                    request_needed = True
+
+        return resp
+
+    def _get_active_fc_targets(self):
+        """
+        Get a list of gateway WWNs that can be used as FCP targets.
+
+        Arguments:
+            mg_conn -- active XG connection to one of the gateways
+
+        Returns:
+            active_gw_fcp_wwns -- list of WWNs
+        """
+        v = self.vmem_vip.basic
+        active_gw_fcp_wwns = []
+
+        for i in self.gateway_ids:
+            bn = "/vshare/state/global/%d/target/fc/**" % self.gateway_ids[i]
+            resp = v.get_node_values(bn)
+
+            for node in resp:
+                if node.endswith('/wwn'):
+                    active_gw_fcp_wwns.append(resp[node])
+
+        return self._convert_wwns_vmem_to_openstack(active_gw_fcp_wwns)
+
+    def _get_igroup(self, volume, connector):
+        """
+        Gets the igroup that should be used when configuring a volume
+
+        Arguments:
+            volume -- volume object used to determine the igroup name
+
+        Returns:
+            igroup_name -- name of igroup (for configuring targets &
+                           initiators)
+        """
+        v = self.vmem_vip
+
+        # Use the connector's primary hostname and use that as the
+        # name of the igroup.  The name must follow syntax rules
+        # required by the array: "must contain only alphanumeric
+        # characters, dashes, and underscores.  The first character
+        # must be alphanumeric".
+        #
+        igroup_name = re.sub(r'[\W]', '_', connector['host'])
+
+        # verify that the igroup has been created on the backend, and
+        # if it doesn't exist, create it!
+        #
+        bn = "/vshare/config/igroup/%s" % igroup_name
+        resp = v.basic.get_node_values(bn)
+
+        if not len(resp):
+            v.igroup.create_igroup(igroup_name)
+
+        return igroup_name
+
     def _get_volume_type_extra_spec(self, volume, spec_key):
         """
+        Parse data stored in a volume_type's extra_specs table.
+
         Code adapted from examples in
         cinder/volume/drivers/solidfire.py and
         cinder/openstack/common/scheduler/filters/capabilities_filter.py.
+
+        Arguments:
+            volume   -- volume object containing volume_type to query
+            spec_key -- the metadata key to search for
+
+        Returns:
+            spec_value -- string value associated with spec_key
         """
         spec_value = None
         ctxt = context.get_admin_context()
@@ -935,6 +920,53 @@ class ViolinFCDriver(FibreChannelDriver):
 
         return spec_value
 
+    def _wait_for_exportstate(self, volume_name, state=False):
+        """
+        Polls backend to verify volume's export configuration.
+
+        XG sets/queries following a request to create or delete a lun
+        export may fail on the backend if vshared is still processing
+        the export action (or times out).  We can check whether it is
+        done by polling the export binding for a lun to ensure it is
+        created or deleted.
+
+        This function will try to verify the creation or removal of
+        export state on both gateway nodes of the array every 5
+        seconds for up to 30 seconds.
+
+        Arguments:
+            volume_name -- name of volume to be polled
+            state       -- True to poll for existence, False for lack of
+
+        Returns:
+            True if the export state was correctly added or removed
+            (depending on 'state' param)
+        """
+        vip = self.vmem_vip.basic
+        status = [False, False]
+        mg_conns = [self.vmem_mga.basic, self.vmem_mgb.basic]
+        success = False
+
+        bn = "/vshare/config/export/container/%s/lun/%s" \
+            % (self.container, volume_name)
+
+        for i in xrange(6):
+            for node_id in xrange(2):
+                if not status[node_id]:
+                    resp = mg_conns[node_id].get_node_values(bn)
+                    if state and len(resp.keys()):
+                        status[node_id] = True
+                    elif (not state) and (not len(resp.keys())):
+                        status[node_id] = True
+
+            if status[0] and status[1]:
+                success = True
+                break
+            else:
+                time.sleep(5)
+
+        return success
+
     def _fatal_error_code(self, response):
         """
         Check the error code in a XG response for a fatal error,
@@ -942,7 +974,7 @@ class ViolinFCDriver(FibreChannelDriver):
         from vdmd_mgmt.c.
 
         Arguments:
-            response: a response dict result from an XG request
+            response -- a response dict result from an XG request
         """
         # known non-fatal response codes
         #
@@ -988,3 +1020,193 @@ class ViolinFCDriver(FibreChannelDriver):
         elif response['code'] == 14121:
             # lc_err_cancelled_err
             raise ViolinBackendErr(message=response['message'])
+
+
+class LunIdList(object):
+    """
+    Tracks available lun_ids for use when exporting a new lun for the
+    first time.  After instantiating a new LunIdList object, it should
+    be updated (basically quiescing volumes/snapshot lun ID allocation
+    between the array and the corresponding Openstack DB metadata).
+
+    After that, the object can be queried to capture the next
+    'available' lun ID for use with exporting a new volume or
+    snapshot.  Only when the volume/snapshot is deleted entirely, the
+    lun ID should be freed.
+
+    Lun IDs are montonically increasing up to a max value of 16k,
+    after which the selection will loop around to lun ID 1 and will
+    continue to increment until an available ID is found.
+    """
+    def __init__(self, db, *args, **kwargs):
+        self.max_lun_id = 16000
+        self.lun_id_list = [0] * self.max_lun_id
+        self.lun_id_list[0] = 1
+        self.prev_index = 1
+        self.free_index = 1
+        self.context = context.get_admin_context()
+        self.db = db
+
+    def update_from_volume_ids(self, id_list=[]):
+        """
+        Walk a list of volumes collected that the array knows about and
+        check for any saved lun_id metadata for each of those volumes to
+        fully sync the list.  Note that the metadata keys are stored as
+        strings.
+
+        Arguments:
+            id_list -- array containing names of volumes that exist on the
+                       backend (volume 'names' are UUIDs if they were made
+                       via the VMEM driver API)
+        """
+        for item in id_list:
+            try:
+                metadata = self.db.volume_metadata_get(self.context, item)
+            except exception.VolumeNotFound:
+                LOG.warn(_("No db state for lun %s, skipping lun_id update"),
+                         item)
+            else:
+                if metadata and 'lun_id' in metadata:
+                    index = int(metadata['lun_id'])
+                    self.lun_id_list[index] = 1
+                    LOG.debug("Set lun_id=%d for volume_id=%s" % (index, item))
+                    self.update_free_index(index)
+
+    def update_from_snapshot_ids(self, id_list=[]):
+        """
+        Walk a list of snapshots collected that the array knows about and
+        check for any saved lun_id metadata for each of those snapshots to
+        fully sync the list.  Note that the metadata keys are stored as
+        strings.
+
+        Arguments:
+            id_list -- array containing names of snapshots that exist on the
+                       backend (snapshot 'names' are UUIDs if they were made
+                       via the VMEM driver API)
+        """
+        for item in id_list:
+            try:
+                metadata = self.db.snapshot_metadata_get(self.context, item)
+            except exception.SnapshotNotFound:
+                LOG.warn(_("No db state for snap %s, skipping lun_id update"),
+                         item)
+            else:
+                if metadata and 'lun_id' in metadata:
+                    index = int(metadata['lun_id'])
+                    self.lun_id_list[index] = 1
+                    LOG.debug("Set lun_id=%d for snapshot_id=%s" %
+                              (index, item))
+                    self.update_free_index(index)
+
+    def get_lun_id_for_volume(self, volume):
+        """
+        Allocate a free a lun ID to a volume and create a lun_id tag
+        in the volume's metadata.
+
+        Arguments:
+            volume -- the volume object to allocate a lun_id to
+        """
+        metadata = self.db.volume_metadata_get(self.context, volume['id'])
+        if not metadata or 'lun_id' not in metadata:
+            metadata = {}
+            metadata['lun_id'] = self.get_next_lun_id_str()
+            self.db.volume_metadata_update(self.context, volume['id'],
+                                           metadata, False)
+            LOG.debug("Assigned lun_id %s to volume %s" %
+                      (metadata['lun_id'], volume['id']))
+        return metadata['lun_id']
+
+    def get_lun_id_for_snapshot(self, snapshot):
+        """
+        Allocate a free a lun ID to a snapshot and create a lun_id tag
+        in the snapshot's metadata.
+
+        Arguments:
+            snapshot -- the snapshot object to allocate a lun_id to
+        """
+        metadata = self.db.snapshot_metadata_get(self.context, snapshot['id'])
+        if not metadata or 'lun_id' not in metadata:
+            metadata = {}
+            metadata['lun_id'] = self.get_next_lun_id_str()
+            self.db.snapshot_metadata_update(self.context, snapshot['id'],
+                                             metadata, False)
+            LOG.debug("Assigned lun_id %s to volume %s" %
+                      (metadata['lun_id'], snapshot['id']))
+        return metadata['lun_id']
+
+    def free_lun_id_for_volume(self, volume):
+        """
+        Remove the lun_id tag saved in the volume's metadata and
+        free the lun ID in the internal tracking array.
+
+        Arguments:
+            volume -- the volume object with a lun ID to be free'd
+        """
+        metadata = self.db.volume_metadata_get(self.context, volume['id'])
+        if metadata and 'lun_id' in metadata:
+            self.free_lun_id_str(metadata['lun_id'])
+
+    def free_lun_id_for_snapshot(self, snapshot):
+        """
+        Remove the lun_id tag saved in the snapshot's metadata and
+        free the lun ID in the internal tracking array.
+
+        Arguments:
+            snapshot -- the snapshot object with a lun ID to be free'd
+        """
+        metadata = self.db.snapshot_metadata_get(self.context, snapshot['id'])
+        if metadata and 'lun_id' in metadata:
+            self.free_lun_id_str(metadata['lun_id'])
+
+    def get_next_lun_id_str(self):
+        """
+        Mark the next available lun_id as allocated and return
+        it to the caller.
+
+        Returns:
+            next_id -- the lun ID that being allocated to the caller
+        """
+        next_id = self.free_index
+        self.lun_id_list[next_id] = 1
+        self.update_free_index()
+        return str(next_id)
+
+    def free_lun_id_str(self, value_str):
+        """
+        Mark a lun_id as now available, as if the lun was de-allocated.
+
+        Arguments:
+            value_str -- lun ID to free (in string format)
+        """
+        value = int(value_str)
+        self.lun_id_list[value] = 0
+        self.update_free_index()
+
+    def update_free_index(self, index=None):
+        """
+        Update the free index, monotonically increasing, and
+        looping back to 1 after the max lun ID value is hit.
+
+        Arguments:
+            index -- assume that all values below this number may be already
+                     allocated, so start searching at that value if it is
+                     higher than the free_index
+        """
+        i = 0
+        count = 0
+        max_size = len(self.lun_id_list)
+        if index and index > self.free_index:
+            i = index + 1
+        else:
+            i = self.free_index
+        # avoid possibility of indexError
+        if i >= max_size:
+            i = 1
+        while self.lun_id_list[i] == 1 and count < max_size:
+            count += 1
+            i += 1
+            if i >= max_size:
+                i = 1
+        self.free_index = i
+        if count == max_size:
+            raise exception.Error("Cannot find free lun_id, giving up!")
