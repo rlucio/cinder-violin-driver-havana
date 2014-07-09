@@ -1,8 +1,8 @@
 cinder-violin-driver-havana
 ===========================
 
-Violin Memory v6000 volume drivers for Openstack Cinder Havana
-release.
+6000 Series All-Flash Array Volume Driver V1.0.0 for OpenStack Cinder
+Havana Release.
 
 This repository contains the latest open-source release of Violin
 Memory's python drivers and client communication libraries for use
@@ -10,6 +10,28 @@ with Openstack Cinder's block storage services.
 
 It is maintained externally for 3rd party developers, testers, and
 users and may be periodically updated in the future.
+
+
+Overview
+--------
+The Volume Driver package for OpenStack Havana from Violin Memory adds
+block-storage service support for Violin V6000 series All-Flash
+Arrays. The package is implemented as a storage "plug-in" using the
+standard Cinder storage driver API, and facilitates the creation,
+attachment, and management of volumes (LUNs) between a Flash Array and
+different host servers.
+
+All Cinder volume features required for the OpenStack Havana release
+are supported, including volume, snapshot, and clone operations. The
+1.0.0 driver package release can be used with any OpenStack Havana
+deployment for all 6000 Series arrays running V6.3.0.4 or V6.3.1 using
+FibreChannel HBAs.
+
+The released software is available as an installable tarball and a
+RHEL6.5 RPM. Software and support for existing Violin Memory customers
+is available from the Violin Memory Support portal at
+www.violinmemory.com/support.
+
 
 Setup
 -----
